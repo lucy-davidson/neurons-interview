@@ -1,185 +1,410 @@
 # Codebase Walkthrough
 
-A file-by-file tour of the backend. If you've read the README and want to understand *how* things work rather than *what* they do, this is the place.
+This document walks through every file in the backend, explaining what it does, why it exists, and how it connects to the rest of the system.
 
 ---
 
-## `app/main.py` — the FastAPI app
+## 1. Entry Point: `app/main.py`
 
-Everything starts here. The main flow is straightforward: client uploads an image + JSON, we validate it, kick off a background task, return 202 immediately. The client polls `GET /api/v1/jobs/{job_id}` until results show up.
+This is the FastAPI application. It's where HTTP requests arrive and where the async job lifecycle is managed.
 
-The validation is fairly aggressive — content type, file size (50 MB), image dimensions (8192px), recommendation count (5), text length (2000 chars). There's also an RGBA check that doesn't reject but warns, because some image providers handle alpha channels inconsistently.
+**What happens when a request comes in:**
 
-The background task (`_process_job`) does two things in parallel: runs the actual agentic workflow, and sends heartbeat pings to the database every 30 seconds. The heartbeat is how we detect orphaned jobs — if the backend crashes mid-flight, a cleanup sweep picks up the stale heartbeat and marks the job as failed. On startup, we also sweep for any "running" or "pending" jobs left over from a previous process and fail them immediately, since their in-memory state is gone.
+1. `POST /api/v1/jobs` receives a multipart form upload with two parts:
+   - `image` — the marketing creative (PNG, JPEG, or WebP)
+   - `request_body` — a JSON file containing the recommendations and brand guidelines
 
-Results stream in incrementally. Every time a variant finishes (pass or fail), the `on_variant_complete` callback writes the current results to PostgreSQL. So the polling endpoint doesn't just return "running" — it returns "running, and here are the 3 variants that are done so far."
+2. The endpoint validates the image through several checks:
+   - Content type (must be PNG, JPEG, or WebP)
+   - File size (max 50 MB)
+   - Image decodability (via Pillow)
+   - Dimensions (max 8192px per side)
+   - RGBA detection (warns about alpha channel inconsistencies across providers)
+   - Recommendation count (max 5) and text length (max 2000 chars per description)
 
-There are a bunch of other endpoints in here too — cancel, feedback, thumbnails, health checks, experiment comparison, metrics. The static HTML frontend is also served from here via `StaticFiles`.
+3. The job is stored in an in-memory dictionary (`_jobs`) and persisted to PostgreSQL (if configured). An `asyncio.create_task` fires off `_process_job()` in the background. The endpoint immediately returns `202 Accepted` with the job ID.
 
----
+4. `_process_job()` starts a heartbeat loop (updates every 30s), binds a structlog context with the job ID, then calls `run_all_recommendations()` from the workflow module. A callback (`on_variant_complete`) persists results to the database after each variant finishes, so the polling endpoint shows partial progress.
 
-## `app/config.py` — settings
+5. `GET /api/v1/jobs/{job_id}` lets the client poll for status. It checks in-memory first (active jobs), then falls back to the database (jobs from previous sessions). Results stream in incrementally as variants complete.
 
-One `Settings` class, everything from env vars. The interesting part is that text and image providers are independently configurable — you can use Gemini for vision/text and OpenAI for image generation, or any combination. Only the active provider's API key is required.
+**Startup lifecycle:**
 
-`model_config = {"extra": "ignore"}` is there so you can have old env vars lying around without pydantic complaining.
+On boot, the `lifespan` context manager:
+1. Initialises the database connection pool and schema
+2. Recovers orphaned jobs from previous sessions (marks them as failed)
+3. Starts a background cleanup loop that sweeps for stale heartbeats every 60s
+4. Starts a dependency health check loop that pings all 3 LLM providers + PostgreSQL every 30s
 
----
+**Other endpoints:**
 
-## `app/models.py` — data contracts
+- `POST /api/v1/jobs/{job_id}/cancel` — marks a running job as failed with "Cancelled by user"
+- `POST /api/v1/jobs/{job_id}/feedback` — records user feedback (thumbs up/down, selected, refinement) with full variant context (provider, model, score)
+- `GET /api/v1/feedback/stats` — aggregate feedback counts across all jobs
+- `GET /api/v1/experiments/comparison` — groups all variant outcomes by text and image provider
+- `GET /api/v1/health/dependencies` — live health check for all providers and the database
+- `GET /api/v1/thumb/{job_id}/{variant_id}` — returns a 300px JPEG thumbnail
+- `GET /api/v1/jobs/{job_id}/image/{variant_id}` — returns the full base64 image
+- `GET /api/v1/metrics/summary` — JSON summary of Prometheus counters for the frontend
+- `GET /metrics` — Prometheus scrape endpoint (auto-instrumented by `prometheus-fastapi-instrumentator`)
+- `GET /health` — liveness probe with database status
+- `GET /` — serves the static HTML frontend
 
-All the Pydantic models in one file. The key thing to understand is the nesting: a `Job` has a list of `RecommendationResult`s, each of which has a list of `VariantResult`s. Each variant tracks which provider and model produced it (for the experiment comparison endpoint later).
-
-`Job.to_response()` strips the original image when returning data to the client, since it's large and the client already has it.
-
----
-
-## `app/db.py` — PostgreSQL persistence
-
-Two tables: `jobs` (with JSONB for results, recommendations, and brand guidelines) and `feedback` (with provider/model context for later analysis).
-
-Everything is wrapped in try/except. If the database goes down, the app keeps running on in-memory state only. This was a deliberate choice — I didn't want a database failure to take down the whole service. The tradeoff is that you lose durability if PostgreSQL is unreachable, but the app stays up.
-
-The heartbeat system lives here too. `touch_heartbeat()` updates a timestamp, and `fail_stale_jobs()` sweeps for anything that hasn't checked in within 5 minutes.
-
----
-
-## `app/services/image.py` — image utilities
-
-Small file. `validate_image()` runs bytes through Pillow to make sure they're actually a valid image. A few base64 conversion helpers.
-
----
-
-## `app/services/llm.py` — the LLM abstraction
-
-This is where all the provider-specific code lives. Two public functions: `vision_chat()` (text/vision LLM) and `edit_image()` (image generation). Agents call these without knowing or caring which provider is behind them.
-
-Three providers are implemented:
-- **OpenAI** — uses `with_raw_response` for vision chat so we can read rate limit headers from the response
-- **Gemini** — the image editor uses the sync SDK in a thread executor because the async client had issues. Retries up to 3 times on empty responses (Gemini sometimes returns no image, usually a throttling signal)
-- **Claude** — vision/text only, no image generation (Anthropic doesn't have one), so it's skipped during image editing fallback
-
-The rate limiter is the most interesting part of this file. Each provider gets its own `_AdaptiveRateLimiter`. It starts at a default RPM (30), but the first time we get an OpenAI response, we read `x-ratelimit-limit-requests` from the headers and adjust to 80% of the actual limit. On 429 errors it halves the rate. After 5 consecutive successes it starts recovering. This means you don't need to manually configure rate limits — the system figures it out.
-
-`_is_rate_limit_error()` is careful to distinguish transient rate limits from permanent "insufficient_quota" errors. If your API key is out of credits, backing off won't help, so we don't treat it as a rate limit.
-
-The fallback chain is per-call: if the primary provider fails, we try alternates in order. A single failed call doesn't permanently switch the default — next time we still try the primary first.
+**Why this pattern:** The agentic workflow involves multiple LLM calls and image generation steps that take 30-120+ seconds per recommendation. An async job queue pattern (submit → poll) prevents HTTP timeouts and lets the frontend show incremental progress.
 
 ---
 
-## `app/workflow/state.py` — graph state
+## 2. Configuration: `app/config.py`
 
-A `TypedDict` that flows through the LangGraph graph. Immutable inputs on one side (original image, recommendation, brand guidelines), mutable state on the other (edit prompt, edited image, evaluation results, attempt counter). The `audit_trail` list is an accumulator that every agent appends to.
+A single `Settings` class using `pydantic-settings`. All configuration is driven by environment variables (or a `.env` file). Key groups:
+
+- **Provider selection** — `text_provider` and `image_provider` are independently configurable (`openai`, `gemini`, or `claude`)
+- **API keys** — `openai_api_key`, `google_api_key`, `anthropic_api_key` (only the active provider's key is required)
+- **Model names** — separately configurable for each provider's vision and image models
+- **Input validation limits** — max file size, dimensions, recommendation count, text length
+- **Rate limiting** — starting RPM and burst size (auto-adjusts from API response headers)
+- **Workflow parameters** — `num_variants` (target accepted variants per recommendation), `max_retries`, `image_size`
+
+`model_config = {"extra": "ignore"}` allows old or unused env vars to exist without causing validation errors.
+
+**Why a separate config file:** Centralises all tuneable parameters so they can be changed via environment variables without touching code. The Docker Compose file passes these through from the `.env` file.
 
 ---
 
-## `app/workflow/graph.py` — orchestration
+## 3. Data Models: `app/models.py`
 
-Two levels of orchestration happen here.
+All Pydantic models live here. This file defines the contract between every layer of the system.
 
-**The inner graph** handles a single variant through the edit-evaluate-refine loop:
+**Request models:**
+- `Recommendation` — a single recommendation with `id`, `title`, `description`, and `type`
+- `BrandGuidelines` — protected regions, typography rules, aspect ratio, brand elements
+- `JobRequest` — the JSON body sent by the client (list of recommendations + guidelines)
 
+**Response models:**
+- `JobResponse` — returned by the API: job ID, status, results, error, and warnings (e.g. RGBA)
+- `RecommendationResult` — per-recommendation container holding a list of `VariantResult`s
+- `VariantResult` — per-variant outcome: status (`accepted` or `max_retries_exceeded`), attempt count, edited image, evaluation score/feedback, audit trail, and provider tracking (text_provider, image_provider, text_model, image_model)
+- `AuditEntry` — a single timestamped log entry from one of the agents
+- `JobSummary` / `JobListResponse` — lightweight projections for the job-list endpoint
+
+**Internal models:**
+- `Job` — the full server-side record including the original image. The `to_response()` method strips the original image (which is large) when returning data to the client.
+- `JobStatus` — enum: `pending`, `running`, `completed`, `failed`
+
+**Why one models file:** The models are the shared language between the API layer, the workflow layer, and the agent layer. Keeping them in one place makes the data contracts easy to review and prevents circular imports.
+
+---
+
+## 4. Database Persistence: `app/db.py`
+
+PostgreSQL persistence using asyncpg for non-blocking access. Two tables:
+
+**`jobs` table:**
+- `job_id` (PK), `status`, `created_at`, `original_image_b64`
+- `recommendations` and `brand_guidelines` as JSONB
+- `results` as JSONB — overwritten incrementally as variants complete
+- `last_heartbeat` — TIMESTAMPTZ, updated every 30s by the background heartbeat loop
+
+**`feedback` table:**
+- Links to a job/variant with `feedback_type`, `comment`, timestamps
+- Stores the provider context: `text_provider`, `image_provider`, `text_model`, `image_model`
+- Stores the critic's `evaluation_score` and `recommendation_type` for later analysis
+
+**Key operations:**
+- `touch_heartbeat()` / `fail_stale_jobs()` — the heartbeat system. If a job's heartbeat goes stale (5 min timeout), the cleanup sweep marks it as failed.
+- `create_job()` / `update_job_status()` / `update_job_results()` — dual-write with in-memory store
+- `save_feedback()` / `get_feedback_stats()` — feedback persistence and aggregation
+
+All operations are wrapped in try/except so database failures never crash the application — they log the error and degrade gracefully to in-memory mode.
+
+---
+
+## 5. Services Layer
+
+### `app/services/image.py`
+
+Image utility functions:
+- `validate_image(data)` — uses Pillow to verify that uploaded bytes are actually a valid image
+- `b64_to_bytes()` / `bytes_to_b64()` — conversions between base64 strings and raw bytes
+
+### `app/services/llm.py`
+
+The LLM abstraction layer. Three providers are supported (OpenAI, Gemini, Claude), each with their own SDK client.
+
+**Two public functions:**
+
+**`vision_chat(system_prompt, user_text, image_b64, second_image_b64)`**
+- Sends a chat completion request with vision capabilities
+- Supports up to two images (the critic needs to compare original vs edited)
+- Used by the ideator, idea critic, critic, and refiner agents
+- Rate-limited per-provider, with automatic fallback to alternate providers on failure
+
+**`edit_image(prompt, image_b64)`**
+- Sends an image edit request to the configured image provider
+- Used by the editor agent
+- Falls back to alternate providers on failure (skips Claude — no native image generation API)
+- Gemini implementation retries up to 3 times on empty responses with exponential backoff
+
+**Adaptive rate limiting:**
+
+Each provider gets its own `_AdaptiveRateLimiter` instance. The limiter:
+- Starts at a configurable default RPM (30 by default)
+- Auto-configures from OpenAI's `x-ratelimit-limit-requests` response header (uses 80% of the actual limit)
+- Halves the rate on errors (`backoff()`)
+- Gradually recovers after 5 consecutive successes (`on_success()`)
+- Uses `aiolimiter.AsyncLimiter` for the actual token-bucket implementation
+
+**`_is_rate_limit_error()`** distinguishes transient rate limits (429, "too many requests", "resource_exhausted") from permanent failures ("insufficient_quota"). Only transient errors trigger backoff.
+
+**Provider fallback:** If the primary provider fails, the system tries alternate providers in order. Only providers with API keys configured are included in the fallback chain. The fallback is per-call, not global — a single failure doesn't switch the default provider.
+
+**Why wrap the API calls:** Isolates provider-specific logic so agents don't need to know about API details. Adding a new provider means implementing two functions (vision chat + image edit) and adding it to the dispatcher — nothing else changes.
+
+---
+
+## 6. Workflow Layer
+
+This is the heart of the system — the LangGraph-based agentic workflow.
+
+### `app/workflow/state.py`
+
+Defines `RecommendationState` as a `TypedDict`. This is the state object that flows through the LangGraph graph. Every agent reads from and writes to this state.
+
+Key fields:
+- **Inputs** (set once): `original_image_b64`, recommendation details, `brand_guidelines_text`
+- **Mutable** (updated by agents): `edit_prompt`, `edited_image_b64`, evaluation results, `refiner_feedback`, `attempt` counter
+- **Accumulator**: `audit_trail` — every agent appends entries here, building the full decision log
+
+### `app/workflow/graph.py`
+
+This file constructs, compiles, and runs the LangGraph StateGraph. It handles two levels of orchestration:
+
+**Inner graph (per variant):**
 ```
 editor → critic → should_retry?
-                    ├── yes → refiner → editor (loop back)
-                    └── no  → END
+                    ├── "refiner" → refiner → editor (loops back)
+                    └── "end"     → END
 ```
 
-This graph is compiled once at import time and reused for every variant. The entry point is `editor` because the edit prompt is already in state — the ideator put it there.
+**Outer orchestration (per recommendation):**
+```
+ideator (generates 10 variant ideas with edit prompts)
+    └─► idea critic (reviews all 10, rejects weak/duplicate ones)
+          └─► pool of approved ideas
+                └─► try in batches of 2:
+                      editor → critic → pass?
+                                          │ no → refiner → editor (retry up to 3x)
+                      keep drawing from pool until 2 accepted or pool exhausted
+```
 
-**The outer orchestration** is plain Python, not a graph. For each recommendation:
+**`build_recommendation_graph()`** creates the per-variant graph:
+1. Three nodes: `editor`, `critic`, `refiner`
+2. Entry point is `editor` (the edit prompt is already in state from the ideator)
+3. After `critic`, a conditional edge (`should_retry()`) checks if the evaluation passed or max attempts reached
 
-1. The ideator generates a pool of 10 variant ideas (each with an edit prompt)
-2. The idea critic reviews the whole pool and filters out weak ones
-3. We draw from the pool in batches of 2, running each batch through the inner graph concurrently
-4. After each batch, we check: do we have 2 accepted variants? If yes, stop. If no, grab the next 2 from the pool.
+The graph is compiled once at module import time for efficiency.
 
-This pool-and-batch approach was a deliberate choice over generating ideas one at a time. If a batch fails, the next ideas are already sitting in the pool — no extra LLM call to brainstorm replacements. The ideator runs once, and then it's all execution.
+**`run_recommendation_workflow()`** orchestrates a single recommendation:
+1. Calls `run_ideator()` to generate a pool of 10 variant ideas
+2. Calls `run_idea_critic()` to filter the pool (removes subtle/duplicate/infeasible ideas)
+3. Draws from the pool in batches of 2. Each batch runs concurrently via `asyncio.gather`
+4. After each batch, checks if we have enough accepted variants (target: 2)
+5. Stops when the target is met or the pool is exhausted
 
-`run_all_recommendations()` runs all recommendations concurrently via `asyncio.gather`. It pre-creates empty `RecommendationResult` objects before starting, so they show up in the API response immediately (with zero variants) and fill in as results arrive.
+**`run_all_recommendations()`** processes all recommendations concurrently:
+- Pre-creates empty `RecommendationResult` objects so they appear in the API response immediately
+- Runs one `run_recommendation_workflow` coroutine per recommendation via `asyncio.gather`
+- Results stream in incrementally through the shared `RecommendationResult` objects
+
+**Why pool-and-batch:** Generating 10 ideas upfront and trying them in batches avoids the latency cost of generating replacement ideas mid-flight. If a batch fails, the next ideas are already waiting in the pool — no extra ideation LLM calls needed.
 
 ---
 
-## The five agents
+## 7. The Five Agents
+
+Each agent is a single async function. The ideator and idea critic operate on lists of variant ideas. The editor, critic, and refiner are LangGraph nodes that take `RecommendationState`, do their work, and return an updated copy.
 
 ### `app/workflow/agents/ideator.py`
 
-Takes a vague recommendation like "strengthen headline impact" and brainstorms 10 specific variant ideas, each with a concrete edit prompt that can go straight to the image editor. The system prompt asks for specific colours, positions, sizes, effects — not abstract concepts.
+**Role:** Turn a vague recommendation into 10 concrete variant ideas, each with a title, description, and edit prompt ready for the image editor.
 
-Retries up to 3 times if the JSON doesn't parse. On the second attempt it adds a "keep descriptions shorter" hint, because the most common failure mode is the LLM's output getting truncated mid-JSON. If all retries fail, it falls back to a single pass-through variant using the original recommendation text, so the rest of the pipeline always has something to work with.
+**How it works:**
+1. Sends the recommendation, brand guidelines, and the original image to the vision LLM
+2. The system prompt instructs the model to return JSON with a `variants` array
+3. Each variant includes an `edit_prompt` — a self-contained instruction for the image editor
+4. Retries up to 3 times on parse failure, with a "keep descriptions shorter" hint on retry
+5. Falls back to a single pass-through variant if all retries fail (so the pipeline always has something to run)
+
+**`run_ideator_replacements()`** generates replacements for rejected ideas, given the approved and rejected lists plus the reviewer's feedback. Used during the idea critique loop (though the current pool-and-batch approach means this is rarely needed).
 
 ### `app/workflow/agents/idea_critic.py`
 
-Reviews all 10 ideas together in a single call. This matters — reviewing them individually wouldn't catch duplicates. It evaluates visual impact, recommendation alignment, brand compliance, distinctiveness, and feasibility.
+**Role:** Review all variant ideas together and reject weak ones before they reach the expensive image generation step.
 
-The prompt explicitly calls out subtle changes as automatic rejections: "slightly increase letter spacing", "marginally bolder font", that kind of thing. This was added after I kept seeing the image editor return the original image unchanged when given weak prompts. Catching those ideas early saves multiple expensive image generation calls.
+**How it works:**
+1. Receives all variant ideas in a single call (not individually — this is important for catching duplicates)
+2. Evaluates each on: visual impact, recommendation alignment, brand compliance, distinctiveness, feasibility
+3. Returns `(approved, rejected, feedback)` tuple
+4. On parse failure: approves all ideas (permissive — better to try than to block)
 
-On parse failure, it approves everything. Better to waste some image generation calls on mediocre ideas than to block the pipeline.
+**Key design detail:** The prompt specifically calls out subtle changes ("slightly increase letter spacing", "marginally bolder font") as automatic rejections. This was added because the biggest real-world problem was the image editor returning unchanged images — catching weak ideas early saves expensive generation attempts.
 
 ### `app/workflow/agents/editor.py`
 
-The simplest agent. Reads the edit prompt from state, calls `edit_image()`, stores the result. That's it. It's a bridge between the ideator's intent and whatever image generation API is configured.
+**Role:** Generate the edited image.
+
+**How it works:**
+1. Reads the `edit_prompt` from state (set by the ideator, or revised by the refiner on retries)
+2. Calls `edit_image()` with the original image and the edit prompt
+3. Stores the resulting base64 image in `edited_image_b64`
+4. Appends to the audit trail
+
+This is the simplest agent — a bridge between the ideator's intent and the image generation model.
 
 ### `app/workflow/agents/critic.py`
 
-This one went through several iterations, because the original version had a fundamental problem: the image editor would return the original image unchanged, and the critic would *accept it* because it knew what changes to look for and convinced itself it could see them. Classic anchoring bias.
+**Role:** Evaluate the edited image against the original recommendation and brand guidelines. This is the quality gate.
 
-The fix was three layers of evaluation:
+**Three-layer evaluation:**
 
-**Layer 1 — SSIM pre-check.** Computes structural similarity between the original and edited images. If SSIM > 0.95, the images are pixel-identical (or close enough). Auto-reject, no LLM call needed. Images are downscaled to 512px first so this is fast.
+1. **SSIM pre-check (deterministic):** Computes structural similarity between original and edited images. If SSIM > 0.95, the images are considered identical — auto-reject without an LLM call. Images are downscaled to 512px for speed.
 
-**Layer 2 — Blind comparison.** Sends both images to the LLM and asks "what's different between these two images?" — crucially, without telling it what the edit was supposed to be. If the model says "no visible difference", we reject. This catches cases where the images are technically different (different compression, minor colour shifts) but a human wouldn't notice.
+2. **Blind visual comparison (unbiased LLM):** Asks "what's different between these two images?" without revealing what the edit was supposed to be. This prevents anchoring bias — the model can't convince itself it sees a change that isn't there just because it knows what to look for. If the blind comparison reports no visible difference, auto-reject.
 
-**Layer 3 — Full evaluation.** Only now do we tell the LLM what the recommendation was and ask it to evaluate compliance. The blind comparison's findings are included as context, so the model can't ignore its own earlier assessment. There's also a `visually_different` field in the response — if the model says false, we force a failure regardless of the score.
+3. **Full LLM evaluation (informed LLM):** With the blind comparison's findings in context, evaluates recommendation compliance and brand guideline compliance. Returns `passed`, `score` (0.0-1.0), `visually_different`, and actionable `feedback`. If `visually_different` is false, the result is overridden to a failure regardless of the score.
+
+**Why three layers:** The single biggest problem in practice was the image editor returning the original image unchanged, and the critic LLM accepting it because it "saw" the expected changes (anchoring bias). SSIM catches pixel-identical images deterministically. The blind comparison catches near-identical images that fool pixel metrics. The informed evaluation handles everything else.
 
 ### `app/workflow/agents/refiner.py`
 
-When the critic rejects a variant, the refiner reads the feedback and writes a revised edit prompt. The critic says "the text is still too small", the refiner says "make the headline text 3x larger and set it in bold white against the dark background." This revised prompt goes straight back to the editor.
+**Role:** Translate critic feedback into a revised edit prompt for the next attempt.
 
-The separation between critic and refiner exists because they're doing different jobs. The critic evaluates ("what's wrong"), the refiner prescribes ("what to do differently"). Asking the editor to interpret raw evaluation feedback directly doesn't work as well.
+**How it works:**
+1. Takes the original recommendation, the previous edit prompt, the critic's feedback, and brand guidelines
+2. Produces a revised `edit_prompt` (1-3 sentences) that addresses what went wrong
+3. Increments the attempt counter
+4. The graph loops back to the editor with the new prompt
 
----
-
-## `app/metrics.py` — Prometheus metrics
-
-Counters, histograms, and gauges for everything: job lifecycle, variant outcomes, LLM call duration (by provider and type), agent invocations, parse failures, dependency health, rate limit state, provider fallbacks. These get scraped by Prometheus and displayed in the Grafana dashboard.
-
----
-
-## Infrastructure
-
-**`Dockerfile`** — Python 3.12 slim, non-root user, requirements installed first for layer caching.
-
-**`docker-compose.yml`** (at the project root) — five services: PostgreSQL, the backend (with volume mounts for hot-reload), pgAdmin, Prometheus, and Grafana. The Grafana datasource and dashboard are auto-provisioned on first boot.
-
-**`tests/`** — 76 tests across 3 files, all mocked, run in about 3 seconds. `test_agents.py` covers agent logic and the three-layer critic. `test_api.py` covers input validation and the job lifecycle. `test_rate_limiter.py` covers the adaptive rate limiter's backoff, recovery, and error classification.
+**Why a separate refiner:** The critic's output is evaluative ("this failed because X"). The refiner translates that into prescriptive guidance ("make the headline 3x larger in bold red"). This separation keeps each agent focused and produces better revision prompts than asking the editor to interpret raw evaluation feedback.
 
 ---
 
-## Data flow
+## 8. Observability: `app/metrics.py`
+
+Prometheus metrics for everything, scraped via the `/metrics` endpoint:
+
+- **Job lifecycle:** `jobs_submitted_total`, `jobs_completed_total` (by status), `jobs_in_progress`
+- **Variant outcomes:** `variants_processed_total` (by status), `variant_score` (histogram), `variant_attempts` (histogram)
+- **LLM API calls:** `llm_call_duration_seconds` (by provider/type), `llm_calls_total`, `llm_errors_total` (by provider/type/error)
+- **Agent-specific:** `agent_invocations_total` (by agent), `llm_parse_failures_total` (by agent)
+- **Dependency health:** `dependency_up` (gauge by dependency), `dependency_latency_ms`
+- **Rate limiting:** `current_rate_limit` (gauge), `provider_fallbacks_total` (by primary/fallback/type)
+
+These metrics feed a Grafana dashboard with 14 panels, auto-provisioned via the `monitoring/grafana/` config.
+
+---
+
+## 9. Infrastructure
+
+### `Dockerfile`
+
+A Python 3.12 slim image:
+1. Copies and installs `requirements.txt` first (layer caching)
+2. Creates a non-root `appuser` for security
+3. Copies the application code and sets ownership
+4. Exposes port 8000
+5. Runs uvicorn as the non-root user
+
+### `docker-compose.yml` (project root)
+
+Five services:
+- **db** — PostgreSQL 16 with a named volume for data persistence
+- **backend** — builds from `backend/Dockerfile`, mounts `app/` and `static/` for hot-reload, depends on `db`
+- **pgadmin** — database browser, auto-configured to connect to `db`
+- **prometheus** — scrapes the backend's `/metrics` endpoint every 5s
+- **grafana** — auto-provisions the datasource and dashboard on first boot
+
+### `requirements.txt`
+
+Key dependencies:
+- `fastapi` + `uvicorn` — web framework and ASGI server
+- `python-multipart` — required for file upload parsing
+- `pydantic` + `pydantic-settings` — data validation and configuration
+- `openai` — OpenAI Python SDK (async support)
+- `google-genai` — Google GenAI SDK
+- `anthropic` — Anthropic Python SDK (async support)
+- `langgraph` — the agentic workflow framework
+- `Pillow` — image validation and thumbnail generation
+- `scikit-image` + `numpy` — SSIM computation
+- `asyncpg` — non-blocking PostgreSQL driver
+- `structlog` — structured JSON logging
+- `prometheus-client` + `prometheus-fastapi-instrumentator` — metrics
+- `aiolimiter` — async rate limiting
+- `httpx` — async HTTP client (fallback for URL-based image responses)
+
+### `tests/`
+
+76 tests across 3 files, all run in ~3 seconds with no API keys:
+
+- `test_agents.py` (27) — agent logic, SSIM computation, blind comparison routing, parse failures, fallbacks, conditional routing edge cases
+- `test_api.py` (33) — input validation (file size, dimensions, content type, recommendation count, text length), job lifecycle, cancel, feedback, thumbnails, DB persistence, CORS, metrics
+- `test_rate_limiter.py` (16) — error detection (`_is_rate_limit_error` distinguishing transient vs permanent), adaptive backoff, recovery after consecutive successes, per-provider isolation
+
+All tests use mocked LLM calls via `unittest.mock.patch`.
+
+---
+
+## 10. Data Flow Summary
+
+Here's the complete journey of a request through the system:
 
 ```
 Client                            Backend
   │                                 │
   ├─ POST /api/v1/jobs ────────────►│
   │   (image + JSON)                │
-  │                                 ├─ Validate, persist, spawn task
-  │◄── 202 {job_id} ───────────────┤
+  │                                 ├─ Validate (type, size, dims, recs)
+  │                                 ├─ Persist to memory + PostgreSQL
+  │                                 ├─ Spawn background task + heartbeat
+  │◄── 202 {job_id, status} ────────┤
   │                                 │
-  │                                 │  For each recommendation (concurrent):
+  │                                 │  Background: run_all_recommendations()
+  │                                 │  ┌─ asyncio.gather (1 per recommendation) ─┐
+  │                                 │  │                                          │
+  │                                 │  │  Ideator (vision LLM)                    │
+  │                                 │  │  → 10 variant ideas with edit prompts    │
+  │                                 │  │                                          │
+  │                                 │  │  Idea Critic (vision LLM)                │
+  │                                 │  │  → filter to approved pool               │
+  │                                 │  │                                          │
+  │                                 │  │  Pool-and-batch loop:                    │
+  │                                 │  │  ┌─ Take next 2 from pool ────────────┐ │
+  │                                 │  │  │                                    │ │
+  │                                 │  │  │ Editor (image gen API)             │ │
+  │                                 │  │  │    ↓                               │ │
+  │                                 │  │  │ Critic (SSIM → blind → informed)   │ │
+  │                                 │  │  │    ↓                               │ │
+  │                                 │  │  │ Pass? ── yes ── save & continue    │ │
+  │                                 │  │  │    │                               │ │
+  │                                 │  │  │    no (< max retries)              │ │
+  │                                 │  │  │    ↓                               │ │
+  │                                 │  │  │ Refiner → revised edit prompt      │ │
+  │                                 │  │  │    ↓                               │ │
+  │                                 │  │  │ (back to Editor)                   │ │
+  │                                 │  │  └────────────────────────────────────┘ │
+  │                                 │  │  2 accepted? Stop. Else: next batch.    │
+  │                                 │  └──────────────────────────────────────────┘
   │                                 │
-  │                                 │    Ideator → 10 ideas with edit prompts
-  │                                 │    Idea Critic → filter pool
+  │                                 ├─ Results persisted after each variant
+  │                                 ├─ Job status → COMPLETED
   │                                 │
-  │                                 │    Batch loop (2 at a time from pool):
-  │                                 │      Editor → Critic (SSIM/blind/full) → pass?
-  │                                 │        no → Refiner → Editor (retry, up to 3x)
-  │                                 │      Stop when 2 accepted or pool empty
-  │                                 │
-  │                                 │    Results written to DB after each variant
-  │                                 │
-  ├─ GET /api/v1/jobs/{id} ────────►│
-  │◄── {status, results, audits} ───┤  (partial results while still running)
+  ├─ GET /api/v1/jobs/{id} ────────►│  (partial results while running)
+  │◄── {status, results, audits} ───┤
 ```
 
-Each variant in the response includes the edited image, an evaluation score, the critic's feedback, a full audit trail, and which provider/model produced it.
+Each `VariantResult` in the response contains:
+- The edited image (base64)
+- An evaluation score (0.0-1.0)
+- Evaluation feedback from the critic
+- A full audit trail showing every decision made by every agent at every attempt
+- The text and image provider/model that produced it
