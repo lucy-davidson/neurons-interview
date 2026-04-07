@@ -151,6 +151,7 @@ async def run_critic(state: RecommendationState) -> RecommendationState:
         user_text="What are the visible differences between these two images?",
         image_b64=state["original_image_b64"],
         second_image_b64=state["edited_image_b64"],
+        runtime_config=state.get("runtime_config"),
     )
 
     logger.info("critic_blind_comparison", attempt=attempt, result=blind_result[:200])
@@ -188,6 +189,7 @@ async def run_critic(state: RecommendationState) -> RecommendationState:
         user_text=user_text,
         image_b64=state["original_image_b64"],
         second_image_b64=state["edited_image_b64"],
+        runtime_config=state.get("runtime_config"),
     )
 
     cleaned = _strip_code_fences(raw)

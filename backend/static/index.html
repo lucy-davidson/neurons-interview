@@ -15,6 +15,9 @@ hr { border: none; border-top: 1px solid #e5e7eb; margin: 16px 0; }
 
 /* Health banner */
 #health-banner { display: none; background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; color: #991b1b; font-weight: 600; }
+#warnings-banner { display: none; background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; color: #92400e; font-size: 0.85em; }
+#warnings-banner ul { margin: 4px 0 0 16px; padding: 0; }
+#warnings-banner li { margin-bottom: 2px; }
 
 /* Form */
 label { display: block; font-size: 0.85em; font-weight: 600; color: #555; margin-bottom: 4px; }
@@ -76,6 +79,7 @@ button.primary:disabled { background: #ccc; cursor: not-allowed; }
   <p style="color:#888;font-size:0.85em;margin-bottom:12px;">Upload a creative, add recommendations, and generate visual variants.</p>
 
   <div id="health-banner">&#9888; Backend is unreachable. Check that the service is running.</div>
+  <div id="warnings-banner"></div>
 
   <hr>
 
@@ -293,6 +297,7 @@ async function fetchAndRender(jobId) {
     if (!resp.ok) { setStatus('Job not found', 'failed'); stopPolling(); return; }
     const data = await resp.json();
     renderResults(data);
+    renderWarnings(data.warnings || []);
 
     const isRunning = data.status === 'pending' || data.status === 'running';
     const accepted = countAccepted(data.results);
@@ -325,6 +330,26 @@ function jobFinished() {
   stopPolling();
   document.getElementById('submit-btn').disabled = false;
   document.getElementById('cancel-btn').style.display = 'none';
+  // Clear transient warnings (rate limit) but keep persistent ones (all-failed)
+  renderWarnings([]);
+}
+
+function renderWarnings(warnings) {
+  const el = document.getElementById('warnings-banner');
+  if (!warnings || warnings.length === 0) {
+    el.style.display = 'none';
+    return;
+  }
+  let html = '&#9888; ';
+  if (warnings.length === 1) {
+    html += esc(warnings[0]);
+  } else {
+    html += '<ul>';
+    for (const w of warnings) html += '<li>' + esc(w) + '</li>';
+    html += '</ul>';
+  }
+  el.innerHTML = html;
+  el.style.display = 'block';
 }
 
 async function cancelJob() {
@@ -369,7 +394,8 @@ function renderResults(data) {
     html += '<div class="subtitle">' + subtitle + '</div>';
 
     if (allFailed) {
-      html += '<div class="error-msg">&#9888; None of the generated variants passed quality review. Try rephrasing the recommendation.</div>';
+      const totalAttempts = rec.variants.reduce((sum, v) => sum + (v.attempts || 1), 0);
+      html += '<div class="error-msg">&#9888; None of the ' + rec.variants.length + ' variant(s) passed quality review (' + totalAttempts + ' total attempts). The image editor may not have made visible changes. Try making the recommendation more specific or visually concrete.</div>';
     }
 
     html += '<div class="variants">';

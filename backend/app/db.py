@@ -40,8 +40,29 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 _MIGRATION_SQL = """
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_heartbeat TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS config_snapshot JSONB;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS experiment_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS variation_name TEXT;
 ALTER TABLE feedback ADD COLUMN IF NOT EXISTS text_model TEXT;
 ALTER TABLE feedback ADD COLUMN IF NOT EXISTS image_model TEXT;
+"""
+
+_EXPERIMENTS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS experiments (
+    experiment_id   TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    status          TEXT NOT NULL DEFAULT 'pending',
+    base_config     JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS experiment_configs (
+    id              SERIAL PRIMARY KEY,
+    experiment_id   TEXT NOT NULL REFERENCES experiments(experiment_id),
+    variation_name  TEXT NOT NULL,
+    config_json     JSONB NOT NULL DEFAULT '{}'
+);
 """
 
 _FEEDBACK_SCHEMA_SQL = """
@@ -78,6 +99,7 @@ async def init_db() -> None:
         async with _pool.acquire() as conn:
             await conn.execute(_SCHEMA_SQL)
             await conn.execute(_FEEDBACK_SCHEMA_SQL)
+            await conn.execute(_EXPERIMENTS_SCHEMA_SQL)
             await conn.execute(_MIGRATION_SQL)
         logger.info("db_initialised")
     except Exception as exc:
@@ -172,6 +194,9 @@ async def create_job(
     original_image_b64: str,
     recommendations: list[dict[str, Any]],
     brand_guidelines: dict[str, Any],
+    config_snapshot: dict[str, Any] | None = None,
+    experiment_id: str | None = None,
+    variation_name: str | None = None,
 ) -> None:
     """Insert a new job row."""
     if not _pool:
@@ -180,8 +205,10 @@ async def create_job(
         await _pool.execute(
             """
             INSERT INTO jobs (job_id, status, created_at, original_image_b64,
-                              recommendations, brand_guidelines, results)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, '[]'::jsonb)
+                              recommendations, brand_guidelines, results,
+                              config_snapshot, experiment_id, variation_name)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, '[]'::jsonb,
+                    $7::jsonb, $8, $9)
             """,
             job_id,
             status,
@@ -189,6 +216,9 @@ async def create_job(
             original_image_b64,
             json.dumps(recommendations),
             json.dumps(brand_guidelines),
+            json.dumps(config_snapshot) if config_snapshot else None,
+            experiment_id,
+            variation_name,
         )
     except Exception as exc:
         logger.error("db_create_job_failed", job_id=job_id, error=str(exc))
@@ -358,6 +388,151 @@ async def get_feedback_stats() -> dict[str, Any]:
         return {}
 
 
+# ── Experiment operations ──────────────────────────────────────────
+
+
+async def create_experiment(
+    experiment_id: str,
+    name: str,
+    description: str | None,
+    base_config: dict[str, Any],
+    variations: list[dict[str, Any]],
+) -> None:
+    """Insert an experiment and its config variations."""
+    if not _pool:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO experiments (experiment_id, name, description, base_config)
+                VALUES ($1, $2, $3, $4::jsonb)
+                """,
+                experiment_id, name, description, json.dumps(base_config),
+            )
+            for v in variations:
+                await conn.execute(
+                    """
+                    INSERT INTO experiment_configs (experiment_id, variation_name, config_json)
+                    VALUES ($1, $2, $3::jsonb)
+                    """,
+                    experiment_id, v["name"], json.dumps(v.get("config", {})),
+                )
+    except Exception as exc:
+        logger.error("db_create_experiment_failed", experiment_id=experiment_id, error=str(exc))
+
+
+async def get_experiment(experiment_id: str) -> dict[str, Any] | None:
+    """Fetch an experiment with its config variations."""
+    if not _pool:
+        return None
+    try:
+        row = await _pool.fetchrow(
+            "SELECT * FROM experiments WHERE experiment_id = $1", experiment_id,
+        )
+        if not row:
+            return None
+        configs = await _pool.fetch(
+            "SELECT variation_name, config_json FROM experiment_configs WHERE experiment_id = $1",
+            experiment_id,
+        )
+        base_config = row["base_config"]
+        if isinstance(base_config, str):
+            base_config = json.loads(base_config)
+        return {
+            "experiment_id": row["experiment_id"],
+            "name": row["name"],
+            "description": row["description"],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "status": row["status"],
+            "base_config": base_config,
+            "variations": [
+                {
+                    "name": c["variation_name"],
+                    "config": json.loads(c["config_json"]) if isinstance(c["config_json"], str) else c["config_json"],
+                }
+                for c in configs
+            ],
+        }
+    except Exception as exc:
+        logger.error("db_get_experiment_failed", experiment_id=experiment_id, error=str(exc))
+        return None
+
+
+async def list_experiments() -> list[dict[str, Any]]:
+    """Return all experiments with lightweight summaries."""
+    if not _pool:
+        return []
+    try:
+        rows = await _pool.fetch(
+            "SELECT experiment_id, name, description, created_at, status FROM experiments ORDER BY created_at DESC"
+        )
+        return [
+            {
+                "experiment_id": r["experiment_id"],
+                "name": r["name"],
+                "description": r["description"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "status": r["status"],
+            }
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.error("db_list_experiments_failed", error=str(exc))
+        return []
+
+
+async def update_experiment_status(experiment_id: str, status: str) -> None:
+    """Update an experiment's status."""
+    if not _pool:
+        return
+    try:
+        await _pool.execute(
+            "UPDATE experiments SET status = $1 WHERE experiment_id = $2",
+            status, experiment_id,
+        )
+    except Exception as exc:
+        logger.error("db_update_experiment_status_failed", error=str(exc))
+
+
+async def get_experiment_jobs(experiment_id: str) -> list[dict[str, Any]]:
+    """Return all jobs belonging to an experiment."""
+    if not _pool:
+        return []
+    try:
+        rows = await _pool.fetch(
+            """
+            SELECT job_id, status, created_at, variation_name, config_snapshot,
+                   results, error
+            FROM jobs
+            WHERE experiment_id = $1
+            ORDER BY variation_name, created_at
+            """,
+            experiment_id,
+        )
+        out = []
+        for r in rows:
+            results = r["results"]
+            if isinstance(results, str):
+                results = json.loads(results)
+            config_snapshot = r.get("config_snapshot")
+            if isinstance(config_snapshot, str):
+                config_snapshot = json.loads(config_snapshot)
+            out.append({
+                "job_id": r["job_id"],
+                "status": r["status"],
+                "created_at": r["created_at"],
+                "variation_name": r["variation_name"],
+                "config_snapshot": config_snapshot,
+                "results": results,
+                "error": r["error"],
+            })
+        return out
+    except Exception as exc:
+        logger.error("db_get_experiment_jobs_failed", error=str(exc))
+        return []
+
+
 def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
     """Convert a database row into the dict shape expected by JobResponse."""
     results = row["results"]
@@ -370,6 +545,10 @@ def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
     if isinstance(brand_guidelines, str):
         brand_guidelines = json.loads(brand_guidelines)
 
+    config_snapshot = row.get("config_snapshot")
+    if isinstance(config_snapshot, str):
+        config_snapshot = json.loads(config_snapshot)
+
     return {
         "job_id": row["job_id"],
         "status": row["status"],
@@ -379,4 +558,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
         "brand_guidelines": brand_guidelines,
         "results": results,
         "error": row["error"],
+        "config_snapshot": config_snapshot,
+        "experiment_id": row.get("experiment_id"),
+        "variation_name": row.get("variation_name"),
     }

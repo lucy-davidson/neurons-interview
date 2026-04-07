@@ -53,6 +53,7 @@ async def run_refiner(state: RecommendationState) -> RecommendationState:
         system_prompt=SYSTEM_PROMPT,
         user_text=user_text,
         image_b64=state.get("edited_image_b64"),
+        runtime_config=state.get("runtime_config"),
     )
 
     trail = list(state.get("audit_trail", []))

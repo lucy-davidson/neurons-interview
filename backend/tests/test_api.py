@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.main import app, _jobs
+from app.config import ConfigOverrides, RuntimeConfig
 from app.models import RecommendationResult, VariantResult
 
 client = TestClient(app)
@@ -570,33 +571,63 @@ def test_cancel_job(mock_run, mock_db):
 
 
 def test_cancel_nonexistent_job():
-    """Cancelling a job that doesn't exist should still return 200."""
+    """Cancelling a job that doesn't exist should return 404."""
     resp = client.post("/api/v1/jobs/nonexistent/cancel")
-    assert resp.status_code == 200
+    assert resp.status_code == 404
 
 
 # ── Feedback endpoint ─────────────────────────────────────────────────
 
 
-@patch("app.main.db")
-def test_submit_feedback(mock_db):
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_submit_feedback(mock_run):
     """Submitting feedback should return recorded status."""
-    mock_db.is_enabled.return_value = False
+    mock_result = RecommendationResult(
+        recommendation_id="rec_1", recommendation_title="T",
+        variants=[VariantResult(
+            variant_id="rec_1_v1", variant_title="V", variant_description="D",
+            status="accepted", attempts=1,
+        )],
+    )
+
+    async def fake_run(**kwargs):
+        kwargs.get("job_results", []).append(mock_result)
+        return kwargs.get("job_results", [])
+
+    mock_run.side_effect = fake_run
+    data = _submit_job()
+    import time; time.sleep(1)
+
     resp = client.post(
-        "/api/v1/jobs/test-job/feedback",
-        json={"variant_id": "v1", "feedback_type": "thumbs_up"},
+        f"/api/v1/jobs/{data['job_id']}/feedback",
+        json={"variant_id": "rec_1_v1", "feedback_type": "thumbs_up"},
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "recorded"
 
 
-@patch("app.main.db")
-def test_submit_feedback_with_comment(mock_db):
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_submit_feedback_with_comment(mock_run):
     """Feedback with a refinement comment should be accepted."""
-    mock_db.is_enabled.return_value = False
+    mock_result = RecommendationResult(
+        recommendation_id="rec_1", recommendation_title="T",
+        variants=[VariantResult(
+            variant_id="rec_1_v1", variant_title="V", variant_description="D",
+            status="accepted", attempts=1,
+        )],
+    )
+
+    async def fake_run(**kwargs):
+        kwargs.get("job_results", []).append(mock_result)
+        return kwargs.get("job_results", [])
+
+    mock_run.side_effect = fake_run
+    data = _submit_job()
+    import time; time.sleep(1)
+
     resp = client.post(
-        "/api/v1/jobs/test-job/feedback",
-        json={"variant_id": "v1", "feedback_type": "refinement", "comment": "Make it brighter"},
+        f"/api/v1/jobs/{data['job_id']}/feedback",
+        json={"variant_id": "rec_1_v1", "feedback_type": "refinement", "comment": "Make it brighter"},
     )
     assert resp.status_code == 200
 
@@ -722,3 +753,492 @@ def test_metrics_summary_endpoint():
     assert "editor" in data["agent_invocations"]
     assert "critic" in data["agent_invocations"]
     assert "refiner" in data["agent_invocations"]
+
+
+# ── Config overrides ─────────────────────────────────────────────────
+
+
+def test_runtime_config_defaults():
+    """RuntimeConfig with no overrides should match global settings."""
+    from app.config import settings
+    rc = RuntimeConfig()
+    assert rc.text_provider == settings.text_provider
+    assert rc.image_provider == settings.image_provider
+    assert rc.num_variants == settings.num_variants
+    assert rc.max_retries == settings.max_retries
+
+
+def test_runtime_config_overrides():
+    """RuntimeConfig should apply overrides over global settings."""
+    rc = RuntimeConfig(ConfigOverrides(
+        text_provider="claude",
+        image_provider="openai",
+        num_variants=5,
+        max_retries=1,
+    ))
+    assert rc.text_provider == "claude"
+    assert rc.image_provider == "openai"
+    assert rc.num_variants == 5
+    assert rc.max_retries == 1
+
+
+def test_runtime_config_partial_overrides():
+    """RuntimeConfig should fall back to defaults for unset overrides."""
+    from app.config import settings
+    rc = RuntimeConfig(ConfigOverrides(text_provider="claude"))
+    assert rc.text_provider == "claude"
+    assert rc.image_provider == settings.image_provider  # default
+    assert rc.num_variants == settings.num_variants  # default
+
+
+def test_runtime_config_snapshot():
+    """Snapshot should return a plain dict of the effective config."""
+    rc = RuntimeConfig(ConfigOverrides(text_provider="gemini", max_retries=5))
+    snap = rc.snapshot()
+    assert isinstance(snap, dict)
+    assert snap["text_provider"] == "gemini"
+    assert snap["max_retries"] == 5
+    assert "text_model" in snap
+    assert "image_model" in snap
+
+
+def test_runtime_config_resolves_models():
+    """RuntimeConfig should resolve model names based on provider."""
+    from app.config import settings
+    rc = RuntimeConfig(ConfigOverrides(text_provider="gemini"))
+    assert rc.text_model == settings.gemini_vision_model
+
+    rc2 = RuntimeConfig(ConfigOverrides(text_provider="openai"))
+    assert rc2.text_model == settings.openai_vision_model
+
+    rc3 = RuntimeConfig(ConfigOverrides(text_model="custom-model-v2"))
+    assert rc3.text_model == "custom-model-v2"
+
+
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_job_with_config_overrides(mock_run):
+    """Submitting a job with config_overrides should snapshot them."""
+    mock_run.return_value = []
+
+    body = json.dumps({
+        "recommendations": [{"id": "r1", "title": "T", "description": "D", "type": "t"}],
+        "brand_guidelines": {"protected_regions": [], "typography": "", "aspect_ratio": "", "brand_elements": ""},
+        "config_overrides": {"text_provider": "claude", "max_retries": 5},
+    })
+
+    resp = client.post(
+        "/api/v1/jobs",
+        files={
+            "image": ("test.png", _make_test_image(), "image/png"),
+            "request_body": ("body.json", body, "application/json"),
+        },
+    )
+    assert resp.status_code == 202
+    job_id = resp.json()["job_id"]
+    job = _jobs[job_id]
+    assert job.config_snapshot is not None
+    assert job.config_snapshot["text_provider"] == "claude"
+    assert job.config_snapshot["max_retries"] == 5
+
+
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_job_without_config_overrides_gets_defaults(mock_run):
+    """A job without config_overrides should still get a config snapshot."""
+    mock_run.return_value = []
+    data = _submit_job()
+    job = _jobs[data["job_id"]]
+    assert job.config_snapshot is not None
+    assert "text_provider" in job.config_snapshot
+    assert "image_provider" in job.config_snapshot
+
+
+# ── Experiment endpoints ──────────────────────────────────────────────
+
+
+@patch("app.main.db")
+def test_create_experiment(mock_db):
+    """Creating an experiment should return an experiment_id."""
+    mock_db.is_enabled.return_value = True
+    mock_db.create_experiment = AsyncMock()
+
+    resp = client.post("/api/v1/experiments", json={
+        "name": "Test experiment",
+        "variations": [
+            {"name": "gemini", "config": {"text_provider": "gemini"}},
+            {"name": "openai", "config": {"text_provider": "openai"}},
+        ],
+    })
+    assert resp.status_code == 201
+    data = resp.json()
+    assert "experiment_id" in data
+    assert data["name"] == "Test experiment"
+    assert data["variations"] == 2
+
+
+def test_create_experiment_no_name():
+    """Creating an experiment without a name should return 400."""
+    resp = client.post("/api/v1/experiments", json={
+        "variations": [{"name": "v1", "config": {}}],
+    })
+    assert resp.status_code == 400
+
+
+def test_create_experiment_no_variations():
+    """Creating an experiment without variations should return 400."""
+    resp = client.post("/api/v1/experiments", json={
+        "name": "Bad experiment",
+        "variations": [],
+    })
+    assert resp.status_code == 400
+
+
+@patch("app.main.db")
+def test_list_experiments(mock_db):
+    """Listing experiments should return from DB."""
+    mock_db.is_enabled.return_value = True
+    mock_db.list_experiments = AsyncMock(return_value=[
+        {"experiment_id": "exp1", "name": "Test", "description": None,
+         "created_at": "2026-04-07", "status": "completed"},
+    ])
+
+    resp = client.get("/api/v1/experiments")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data["experiments"]) == 1
+    assert data["experiments"][0]["experiment_id"] == "exp1"
+
+
+@patch("app.main.db")
+def test_get_experiment(mock_db):
+    """Getting a specific experiment should return its details."""
+    mock_db.is_enabled.return_value = True
+    mock_db.get_experiment = AsyncMock(return_value={
+        "experiment_id": "exp1",
+        "name": "Provider comparison",
+        "description": "Gemini vs OpenAI",
+        "created_at": "2026-04-07",
+        "status": "pending",
+        "base_config": {},
+        "variations": [
+            {"name": "gemini", "config": {"text_provider": "gemini"}},
+            {"name": "openai", "config": {"text_provider": "openai"}},
+        ],
+    })
+
+    resp = client.get("/api/v1/experiments/exp1")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["name"] == "Provider comparison"
+    assert len(data["variations"]) == 2
+
+
+@patch("app.main.db")
+def test_get_experiment_not_found(mock_db):
+    """Getting a nonexistent experiment should return 404."""
+    mock_db.is_enabled.return_value = True
+    mock_db.get_experiment = AsyncMock(return_value=None)
+
+    resp = client.get("/api/v1/experiments/nonexistent")
+    assert resp.status_code == 404
+
+
+@patch("app.main.db")
+def test_experiment_results(mock_db):
+    """Experiment results should aggregate by variation."""
+    mock_db.is_enabled.return_value = True
+    mock_db.get_experiment = AsyncMock(return_value={
+        "experiment_id": "exp1", "name": "Test", "description": None,
+        "created_at": "2026-04-07", "status": "running",
+        "base_config": {}, "variations": [],
+    })
+    mock_db.get_experiment_jobs = AsyncMock(return_value=[
+        {
+            "job_id": "j1", "status": "completed", "created_at": "2026-04-07",
+            "variation_name": "gemini", "config_snapshot": {"text_provider": "gemini"},
+            "results": [{
+                "recommendation_id": "r1", "recommendation_title": "T",
+                "variants": [
+                    {"variant_id": "v1", "status": "accepted", "evaluation_score": 0.9, "attempts": 1},
+                    {"variant_id": "v2", "status": "accepted", "evaluation_score": 0.8, "attempts": 2},
+                ],
+            }],
+            "error": None,
+        },
+        {
+            "job_id": "j2", "status": "completed", "created_at": "2026-04-07",
+            "variation_name": "openai", "config_snapshot": {"text_provider": "openai"},
+            "results": [{
+                "recommendation_id": "r1", "recommendation_title": "T",
+                "variants": [
+                    {"variant_id": "v1", "status": "accepted", "evaluation_score": 0.7, "attempts": 3},
+                    {"variant_id": "v2", "status": "max_retries_exceeded", "evaluation_score": 0.3, "attempts": 3},
+                ],
+            }],
+            "error": None,
+        },
+    ])
+    mock_db.update_experiment_status = AsyncMock()
+
+    resp = client.get("/api/v1/experiments/exp1/results")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "completed"
+    assert len(data["variations"]) == 2
+
+    gemini = next(v for v in data["variations"] if v["name"] == "gemini")
+    openai = next(v for v in data["variations"] if v["name"] == "openai")
+
+    assert gemini["variants_accepted"] == 2
+    assert gemini["acceptance_rate"] == 1.0
+    assert openai["variants_accepted"] == 1
+    assert openai["acceptance_rate"] == 0.5
+
+
+# ── Input validation edge cases ───────────────────────────────────────
+
+
+def test_empty_recommendation_id():
+    """Recommendation with empty ID should be rejected."""
+    body = json.dumps({
+        "recommendations": [{"id": "", "title": "T", "description": "D", "type": "t"}],
+        "brand_guidelines": {"protected_regions": [], "typography": "", "aspect_ratio": "", "brand_elements": ""},
+    })
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", _make_test_image(), "image/png"), "request_body": ("b.json", body, "application/json")},
+    )
+    assert resp.status_code == 400
+    assert "ID" in resp.json()["detail"]
+
+
+def test_whitespace_only_recommendation_title():
+    """Recommendation with whitespace-only title should be rejected."""
+    body = json.dumps({
+        "recommendations": [{"id": "r1", "title": "   ", "description": "D", "type": "t"}],
+        "brand_guidelines": {"protected_regions": [], "typography": "", "aspect_ratio": "", "brand_elements": ""},
+    })
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", _make_test_image(), "image/png"), "request_body": ("b.json", body, "application/json")},
+    )
+    assert resp.status_code == 400
+    assert "title" in resp.json()["detail"]
+
+
+def test_duplicate_recommendation_ids():
+    """Duplicate recommendation IDs should be rejected."""
+    body = json.dumps({
+        "recommendations": [
+            {"id": "rec_1", "title": "A", "description": "D1", "type": "t"},
+            {"id": "rec_1", "title": "B", "description": "D2", "type": "t"},
+        ],
+        "brand_guidelines": {"protected_regions": [], "typography": "", "aspect_ratio": "", "brand_elements": ""},
+    })
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", _make_test_image(), "image/png"), "request_body": ("b.json", body, "application/json")},
+    )
+    assert resp.status_code == 400
+    assert "Duplicate" in resp.json()["detail"]
+
+
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_invalid_provider_in_config_overrides(mock_run):
+    """Invalid provider name in config_overrides should be rejected."""
+    mock_run.return_value = []
+    body = json.dumps({
+        "recommendations": [{"id": "r1", "title": "T", "description": "D", "type": "t"}],
+        "brand_guidelines": {"protected_regions": [], "typography": "", "aspect_ratio": "", "brand_elements": ""},
+        "config_overrides": {"text_provider": "banana"},
+    })
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", _make_test_image(), "image/png"), "request_body": ("b.json", body, "application/json")},
+    )
+    assert resp.status_code == 400
+    assert "banana" in resp.json()["detail"]
+
+
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_negative_num_variants_rejected(mock_run):
+    """Negative num_variants should be rejected."""
+    mock_run.return_value = []
+    body = json.dumps({
+        "recommendations": [{"id": "r1", "title": "T", "description": "D", "type": "t"}],
+        "brand_guidelines": {"protected_regions": [], "typography": "", "aspect_ratio": "", "brand_elements": ""},
+        "config_overrides": {"num_variants": -1},
+    })
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", _make_test_image(), "image/png"), "request_body": ("b.json", body, "application/json")},
+    )
+    assert resp.status_code == 400
+    assert "num_variants" in resp.json()["detail"]
+
+
+def test_zero_byte_image():
+    """A zero-byte image file should be rejected."""
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", b"", "image/png"), "request_body": ("b.json", _make_request_body(), "application/json")},
+    )
+    assert resp.status_code == 400
+    assert "empty" in resp.json()["detail"].lower()
+
+
+def test_non_json_request_body():
+    """A non-JSON request body should return a helpful error."""
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", _make_test_image(), "image/png"), "request_body": ("b.json", b"not json at all", "application/json")},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    # Should NOT contain Pydantic internals
+    assert "validation error" not in detail.lower()
+    assert "recommendations" in detail.lower()
+
+
+def test_experiment_duplicate_variation_names():
+    """Experiment with duplicate variation names should be rejected."""
+    resp = client.post("/api/v1/experiments", json={
+        "name": "Test",
+        "variations": [
+            {"name": "v1", "config": {}},
+            {"name": "v1", "config": {}},
+        ],
+    })
+    assert resp.status_code == 400
+    assert "Duplicate" in resp.json()["detail"]
+
+
+def test_experiment_invalid_provider_in_variation():
+    """Invalid provider in variation config should be rejected."""
+    resp = client.post("/api/v1/experiments", json={
+        "name": "Test",
+        "variations": [
+            {"name": "v1", "config": {"text_provider": "banana"}},
+        ],
+    })
+    assert resp.status_code == 400
+    assert "banana" in resp.json()["detail"]
+
+
+def test_config_overrides_validation():
+    """ConfigOverrides.validate_values should catch invalid values."""
+    from app.config import ConfigOverrides
+    ov = ConfigOverrides(text_provider="banana", num_variants=-1)
+    errors = ov.validate_values()
+    assert len(errors) == 2
+    assert any("banana" in e for e in errors)
+    assert any("num_variants" in e for e in errors)
+
+    ov2 = ConfigOverrides(text_provider="gemini", num_variants=3)
+    assert ov2.validate_values() == []
+
+
+@patch("app.main.db")
+def test_feedback_nonexistent_job(mock_db):
+    """Feedback for a non-existent job should return 404."""
+    mock_db.is_enabled.return_value = True
+    mock_db.get_job = AsyncMock(return_value=None)
+    resp = client.post(
+        "/api/v1/jobs/fake-job-id/feedback",
+        json={"variant_id": "v1", "feedback_type": "thumbs_up"},
+    )
+    assert resp.status_code == 404
+    assert "not found" in resp.json()["detail"].lower()
+
+
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_feedback_nonexistent_variant(mock_run):
+    """Feedback for a variant that doesn't belong to the job should return 404."""
+    mock_result = RecommendationResult(
+        recommendation_id="rec_1",
+        recommendation_title="Test",
+        variants=[VariantResult(
+            variant_id="rec_1_v1", variant_title="V", variant_description="D",
+            status="accepted", attempts=1,
+        )],
+    )
+
+    async def fake_run(**kwargs):
+        job_results = kwargs.get("job_results", [])
+        job_results.append(mock_result)
+        return job_results
+
+    mock_run.side_effect = fake_run
+    data = _submit_job()
+    import time; time.sleep(1)
+
+    resp = client.post(
+        f"/api/v1/jobs/{data['job_id']}/feedback",
+        json={"variant_id": "nonexistent_variant", "feedback_type": "thumbs_up"},
+    )
+    assert resp.status_code == 404
+    assert "variant" in resp.json()["detail"].lower()
+
+
+def test_feedback_comment_too_long():
+    """Feedback with an extremely long comment should be rejected."""
+    # Need a real job for this test, but we can test the length check directly
+    # since it happens before the job lookup
+    resp = client.post(
+        "/api/v1/jobs/any-job/feedback",
+        json={"variant_id": "v1", "feedback_type": "thumbs_up", "comment": "x" * 3000},
+    )
+    assert resp.status_code == 400
+    assert "comment" in resp.json()["detail"].lower()
+
+
+@patch("app.main.db")
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_cancel_completed_job(mock_run, mock_db):
+    """Cancelling a completed job should return informative message."""
+    mock_db.is_enabled.return_value = False
+    mock_run.return_value = []
+
+    async def fake_run(**kwargs):
+        return kwargs.get("job_results", [])
+
+    mock_run.side_effect = fake_run
+    data = _submit_job()
+    import time; time.sleep(1)
+
+    resp = client.post(f"/api/v1/jobs/{data['job_id']}/cancel")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "already_completed"
+
+
+def test_brand_guidelines_too_long():
+    """Brand guidelines with extremely long text should be rejected."""
+    body = json.dumps({
+        "recommendations": [{"id": "r1", "title": "T", "description": "D", "type": "t"}],
+        "brand_guidelines": {
+            "protected_regions": [],
+            "typography": "x" * 6000,
+            "aspect_ratio": "",
+            "brand_elements": "",
+        },
+    })
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", _make_test_image(), "image/png"), "request_body": ("b.json", body, "application/json")},
+    )
+    assert resp.status_code == 400
+    assert "typography" in resp.json()["detail"]
+
+
+def test_invalid_image_provider_in_config():
+    """Claude is not a valid image provider — should be rejected."""
+    body = json.dumps({
+        "recommendations": [{"id": "r1", "title": "T", "description": "D", "type": "t"}],
+        "brand_guidelines": {"protected_regions": [], "typography": "", "aspect_ratio": "", "brand_elements": ""},
+        "config_overrides": {"image_provider": "claude"},
+    })
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", _make_test_image(), "image/png"), "request_body": ("b.json", body, "application/json")},
+    )
+    assert resp.status_code == 400
+    assert "claude" in resp.json()["detail"]

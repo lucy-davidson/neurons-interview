@@ -38,6 +38,7 @@ class JobRequest(BaseModel):
 
     recommendations: list[Recommendation]
     brand_guidelines: BrandGuidelines
+    config_overrides: dict[str, str | int | None] | None = None
 
 
 class JobStatus(str, Enum):
@@ -130,6 +131,10 @@ class Job(BaseModel):
     brand_guidelines: BrandGuidelines = Field(default_factory=BrandGuidelines)
     results: list[RecommendationResult] = Field(default_factory=list)
     error: str | None = None
+    # Experiment support
+    config_snapshot: dict | None = None
+    experiment_id: str | None = None
+    variation_name: str | None = None
 
     def to_response(self) -> JobResponse:
         """Project this internal record into the public API shape."""

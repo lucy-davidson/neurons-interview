@@ -113,6 +113,7 @@ async def run_ideator(
     brand_guidelines_text: str,
     image_b64: str,
     num_variants: int = 5,
+    runtime_config: object | None = None,
 ) -> list[dict[str, str]]:
     """Generate variant ideas for a recommendation.
 
@@ -144,6 +145,7 @@ async def run_ideator(
             system_prompt=SYSTEM_PROMPT,
             user_text=user_text,
             image_b64=image_b64,
+            runtime_config=runtime_config,
         )
 
         try:

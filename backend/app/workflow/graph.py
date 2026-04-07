@@ -94,6 +94,7 @@ async def _run_variant(
     variant_id: str,
     brand_guidelines_text: str,
     max_attempts: int,
+    runtime_config: Any | None = None,
 ) -> VariantResult:
     """Execute the edit-evaluate-refine loop for one variant idea."""
     initial_state: RecommendationState = {
@@ -103,6 +104,7 @@ async def _run_variant(
         "recommendation_description": variant["description"],
         "recommendation_type": recommendation.type,
         "brand_guidelines_text": brand_guidelines_text,
+        "runtime_config": runtime_config,
         "plan": "",
         "edit_prompt": variant.get("edit_prompt", variant["description"]),
         "plan_approved": True,
@@ -130,7 +132,16 @@ async def _run_variant(
 
     status = "accepted" if final_state.get("evaluation_passed") else "max_retries_exceeded"
 
+    # Use runtime_config if available, fall back to global settings
     from app.config import settings as _settings
+    rc = runtime_config
+    text_provider = rc.text_provider if rc else _settings.text_provider
+    image_provider = rc.image_provider if rc else _settings.image_provider
+    text_model = rc.text_model if rc else (
+        getattr(_settings, f"{_settings.text_provider}_vision_model", _settings.text_provider)
+        if _settings.text_provider != "claude" else _settings.claude_vision_model
+    )
+    image_model = rc.image_model if rc else getattr(_settings, f"{_settings.image_provider}_image_model", _settings.image_provider)
 
     return VariantResult(
         variant_id=variant_id,
@@ -142,10 +153,10 @@ async def _run_variant(
         evaluation_score=final_state.get("evaluation_score"),
         evaluation_feedback=final_state.get("evaluation_feedback"),
         audit_trail=final_state.get("audit_trail", []),
-        text_provider=_settings.text_provider,
-        image_provider=_settings.image_provider,
-        text_model=getattr(_settings, f"{_settings.text_provider}_vision_model", _settings.text_provider) if _settings.text_provider != "claude" else _settings.claude_vision_model,
-        image_model=getattr(_settings, f"{_settings.image_provider}_image_model", _settings.image_provider),
+        text_provider=text_provider,
+        image_provider=image_provider,
+        text_model=text_model,
+        image_model=image_model,
     )
 
 
@@ -159,6 +170,7 @@ async def run_recommendation_workflow(
     max_attempts: int = 3,
     rec_result: RecommendationResult | None = None,
     on_variant_complete: Any | None = None,
+    runtime_config: Any | None = None,
 ) -> RecommendationResult:
     """Ideate, critique ideas, then run each approved variant through the graph.
 
@@ -183,7 +195,8 @@ async def run_recommendation_workflow(
 
     # Generate a pool of ideas upfront (10), then try them in batches
     POOL_SIZE = 10
-    BATCH_SIZE = _settings.num_variants  # how many to try at a time (default 2)
+    rc = runtime_config
+    BATCH_SIZE = rc.num_variants if rc else _settings.num_variants  # how many to try at a time (default 2)
 
     idea_pool = await run_ideator(
         recommendation_title=recommendation.title,
@@ -192,6 +205,7 @@ async def run_recommendation_workflow(
         brand_guidelines_text=guidelines_text,
         image_b64=image_b64,
         num_variants=POOL_SIZE,
+        runtime_config=runtime_config,
     )
     logger.info("idea_pool_generated", pool_size=len(idea_pool), recommendation_id=recommendation.id)
 
@@ -203,6 +217,7 @@ async def run_recommendation_workflow(
         brand_guidelines_text=guidelines_text,
         image_b64=image_b64,
         variants=idea_pool,
+        runtime_config=runtime_config,
     )
     # Use approved ideas as the pool; if critic rejected too many, keep originals
     pool = approved if len(approved) >= BATCH_SIZE else idea_pool
@@ -221,6 +236,7 @@ async def run_recommendation_workflow(
                 variant_id=f"{recommendation.id}_v{idx + 1}",
                 brand_guidelines_text=guidelines_text,
                 max_attempts=max_attempts,
+                runtime_config=runtime_config,
             )
             rec_result.variants.append(vr)
             metrics.variants_processed.labels(status=vr.status).inc()
@@ -285,6 +301,7 @@ async def run_all_recommendations(
     max_attempts: int = 3,
     job_results: list[RecommendationResult] | None = None,
     on_variant_complete: Any | None = None,
+    runtime_config: Any | None = None,
 ) -> list[RecommendationResult]:
     """Process every recommendation concurrently.
 
@@ -309,6 +326,7 @@ async def run_all_recommendations(
         run_recommendation_workflow(
             image_b64, rec, brand_guidelines, max_attempts,
             rec_result=rr, on_variant_complete=on_variant_complete,
+            runtime_config=runtime_config,
         )
         for rec, rr in zip(recommendations, rec_results)
     ]

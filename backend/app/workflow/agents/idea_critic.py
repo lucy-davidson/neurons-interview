@@ -72,6 +72,7 @@ async def run_idea_critic(
     brand_guidelines_text: str,
     image_b64: str,
     variants: list[dict[str, str]],
+    runtime_config: object | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], str]:
     """Review variant ideas and split into approved and rejected lists.
 
@@ -102,6 +103,7 @@ async def run_idea_critic(
         system_prompt=SYSTEM_PROMPT,
         user_text=user_text,
         image_b64=image_b64,
+        runtime_config=runtime_config,
     )
 
     cleaned = _strip_code_fences(raw)

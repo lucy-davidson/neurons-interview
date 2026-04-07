@@ -6,7 +6,7 @@ a clear contract between agents (editor, critic, refiner).
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from app.models import AuditEntry
 
@@ -25,6 +25,7 @@ class RecommendationState(TypedDict, total=False):
     recommendation_description: str
     recommendation_type: str
     brand_guidelines_text: str  # JSON-serialised BrandGuidelines
+    runtime_config: Any  # RuntimeConfig instance (passed through, not serialised)
 
     # -- Mutable state (updated by agents across iterations) --------------
     plan: str

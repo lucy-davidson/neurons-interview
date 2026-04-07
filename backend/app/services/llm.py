@@ -105,6 +105,24 @@ def _get_limiter(provider: str) -> _AdaptiveRateLimiter:
     return _limiters[provider]
 
 
+def get_rate_limit_status() -> dict[str, Any]:
+    """Return current rate limiter state for all providers.
+
+    Used by the polling endpoint to surface rate limit warnings.
+    """
+    status: dict[str, Any] = {"any_limited": False, "providers": {}}
+    for name, limiter in _limiters.items():
+        is_limited = limiter.rpm < limiter._default_rpm
+        status["providers"][name] = {
+            "current_rpm": round(limiter.rpm, 1),
+            "default_rpm": limiter._default_rpm,
+            "is_limited": is_limited,
+        }
+        if is_limited:
+            status["any_limited"] = True
+    return status
+
+
 def _is_rate_limit_error(exc: Exception) -> bool:
     """Check if an exception indicates a transient rate limit (not quota exhaustion)."""
     msg = str(exc).lower()
@@ -243,14 +261,18 @@ async def vision_chat(
     user_text: str,
     image_b64: str | None = None,
     second_image_b64: str | None = None,
+    runtime_config: Any | None = None,
 ) -> str:
     """Send a vision-capable chat completion and return the assistant text.
 
     Supports up to two images (e.g. original + edited for comparison).
     Falls back to the alternate provider if the primary fails and the
     alternate has an API key configured.
+
+    If *runtime_config* is provided, uses its provider/model settings
+    instead of the global defaults.
     """
-    provider = settings.text_provider
+    provider = runtime_config.text_provider if runtime_config else settings.text_provider
     limiter = _get_limiter(provider)
     await limiter.acquire()
     metrics.llm_calls_total.labels(provider=provider, call_type="vision_chat").inc()
@@ -410,13 +432,16 @@ async def _call_edit_image(provider: str, prompt: str, image_b64: str) -> str:
     return await _openai_edit_image(prompt, image_b64)
 
 
-async def edit_image(prompt: str, image_b64: str) -> str:
+async def edit_image(prompt: str, image_b64: str, runtime_config: Any | None = None) -> str:
     """Edit an image and return the result as a base-64 encoded PNG string.
 
     Falls back to the alternate provider if the primary fails and the
     alternate has an API key configured.
+
+    If *runtime_config* is provided, uses its provider/model settings
+    instead of the global defaults.
     """
-    provider = settings.image_provider
+    provider = runtime_config.image_provider if runtime_config else settings.image_provider
     limiter = _get_limiter(provider)
     await limiter.acquire()
     metrics.llm_calls_total.labels(provider=provider, call_type="edit_image").inc()

@@ -53,9 +53,9 @@ Variants are tried in batches of 2 from the pool of approved ideas. If a batch f
 
 ### Unit tests (optional — implemented)
 
-76 tests across 3 files, all run in ~3 seconds with no API keys:
+106 tests across 3 files, all run in ~7 seconds with no API keys:
 - 27 agent tests — parsing, fallbacks, SSIM, blind comparison, routing edge cases
-- 33 API tests — validation, job lifecycle, cancel, feedback, thumbnails, DB persistence, CORS
+- 63 API tests — validation, job lifecycle, cancel, feedback, thumbnails, DB persistence, config overrides, experiments, error messages
 - 16 rate limiter tests — error detection, adaptive backoff, per-provider isolation
 
 ### Frontend (optional — implemented)
@@ -76,7 +76,7 @@ Static HTML/JS served by FastAPI. No framework, no build step. Sample data pre-l
 
 **User feedback** — like/dislike/refine/use-this buttons on each variant. Stored in PostgreSQL with the provider, model, and critic score for later analysis. The idea is to eventually use this to calibrate the critic and tune the ideator prompts.
 
-**Experiment comparison** — every variant records which provider and model produced it. A comparison endpoint aggregates acceptance rates and scores by provider so you can make data-driven model choices.
+**Experiment scaffolding** — per-job config overrides let you change the provider, model, or workflow parameters (retries, variant count) without restarting the server. An experiment registry groups related jobs into named variations for A/B testing. Submit the same creative across all variations in one call, then compare acceptance rates, scores, and attempt counts side by side.
 
 ---
 

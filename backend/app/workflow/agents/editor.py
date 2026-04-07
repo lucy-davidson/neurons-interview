@@ -33,6 +33,7 @@ async def run_editor(state: RecommendationState) -> RecommendationState:
     edited_b64 = await edit_image(
         prompt=edit_prompt,
         image_b64=state["original_image_b64"],
+        runtime_config=state.get("runtime_config"),
     )
 
     trail = list(state.get("audit_trail", []))

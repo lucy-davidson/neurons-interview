@@ -76,6 +76,11 @@ Three LLM providers supported with automatic fallback: **Gemini**, **OpenAI**, *
 | `GET` | `/api/v1/feedback/stats` | Aggregate feedback statistics. |
 | `GET` | `/api/v1/health/dependencies` | Live health check for all providers + DB. |
 | `GET` | `/api/v1/experiments/comparison` | Provider comparison data. |
+| `POST` | `/api/v1/experiments` | Create an experiment with config variations. |
+| `GET` | `/api/v1/experiments` | List all experiments. |
+| `GET` | `/api/v1/experiments/{id}` | Experiment detail with variations. |
+| `POST` | `/api/v1/experiments/{id}/run` | Run all variations with same input. Returns `202`. |
+| `GET` | `/api/v1/experiments/{id}/results` | Per-variation comparison (acceptance rate, scores). |
 | `GET` | `/api/v1/metrics/summary` | System metrics summary (JSON). |
 | `GET` | `/metrics` | Prometheus scrape endpoint. |
 | `GET` | `/health` | Liveness probe with DB status. |
@@ -148,9 +153,9 @@ pip install -r requirements.txt pytest
 python -m pytest tests/ -v
 ```
 
-76 tests across 3 files:
+106 tests across 3 files:
 - `test_agents.py` (27) -- agent logic, SSIM, blind comparison, routing
-- `test_api.py` (33) -- validation, lifecycle, cancel, feedback, thumbnails, DB, metrics
+- `test_api.py` (63) -- validation, lifecycle, cancel, feedback, thumbnails, DB, metrics, config overrides, experiments, error messages
 - `test_rate_limiter.py` (16) -- error detection, adaptive backoff, per-provider isolation
 
 All tests mock LLM calls -- no API keys needed.

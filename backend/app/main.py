@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
+import os
+import pathlib
+import uuid
 from contextlib import asynccontextmanager
 
 import structlog
@@ -23,19 +27,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
-from app.config import settings
+from app.config import settings, ConfigOverrides, RuntimeConfig
 from app import db, metrics
 from app.models import (
+    BrandGuidelines,
     Job,
     JobListResponse,
     JobRequest,
     JobResponse,
     JobStatus,
     JobSummary,
+    Recommendation,
     RecommendationResult,
 )
+from PIL import Image as PILImage
+
 from app.services.image import validate_image
-from app.services.llm import check_openai_health, check_gemini_health, check_claude_health
+from app.services.llm import check_openai_health, check_gemini_health, check_claude_health, get_rate_limit_status
 from app.workflow.graph import run_all_recommendations
 
 # ── Structured logging ─────────────────────────────────────────────
@@ -43,8 +51,7 @@ from app.workflow.graph import run_all_recommendations
 # Write JSON logs to a persistent file (if /app/logs is mounted)
 _log_handlers: list[logging.Handler] = [logging.StreamHandler()]  # stdout
 _log_dir = "/app/logs"
-import os as _os
-if _os.path.isdir(_log_dir):
+if os.path.isdir(_log_dir):
     _file_handler = logging.FileHandler(f"{_log_dir}/backend.log")
     _log_handlers.append(_file_handler)
 
@@ -201,6 +208,117 @@ app.add_middleware(
 ALLOWED_CONTENT_TYPES: set[str] = {"image/png", "image/jpeg", "image/webp"}
 
 
+# ── Shared validation helpers ──────────────────────────────────────
+
+
+MAX_GUIDELINES_TEXT_LENGTH = 5000
+
+
+def _validate_brand_guidelines(guidelines: BrandGuidelines) -> None:
+    """Validate brand guidelines field lengths. Raises HTTPException on failure."""
+    for field_name, value in [
+        ("typography", guidelines.typography),
+        ("aspect_ratio", guidelines.aspect_ratio),
+        ("brand_elements", guidelines.brand_elements),
+    ]:
+        if len(value) > MAX_GUIDELINES_TEXT_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Brand guidelines '{field_name}' ({len(value)} chars) "
+                f"exceeds {MAX_GUIDELINES_TEXT_LENGTH} character limit.",
+            )
+    for i, region in enumerate(guidelines.protected_regions):
+        if len(region) > MAX_GUIDELINES_TEXT_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Protected region #{i + 1} ({len(region)} chars) "
+                f"exceeds {MAX_GUIDELINES_TEXT_LENGTH} character limit.",
+            )
+
+
+def _validate_recommendations(recommendations: list[Recommendation]) -> None:
+    """Validate recommendation fields. Raises HTTPException on failure."""
+    seen_ids: set[str] = set()
+    for rec in recommendations:
+        # Whitespace-only / empty checks
+        if not rec.id.strip():
+            raise HTTPException(status_code=400, detail="Recommendation ID cannot be empty.")
+        if not rec.title.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Recommendation '{rec.id}' title cannot be empty.",
+            )
+        if not rec.description.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Recommendation '{rec.id}' description cannot be empty.",
+            )
+        # Duplicate IDs
+        if rec.id in seen_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate recommendation ID '{rec.id}'. Each recommendation must have a unique ID.",
+            )
+        seen_ids.add(rec.id)
+        # Text length
+        if len(rec.description) > settings.max_recommendation_text_length:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Recommendation '{rec.id}' description ({len(rec.description)} chars) "
+                f"exceeds {settings.max_recommendation_text_length} character limit.",
+            )
+
+
+async def _validate_image(image: UploadFile) -> tuple[bytes, list[str]]:
+    """Validate an uploaded image file. Returns (image_bytes, warnings).
+
+    Raises HTTPException on validation failure.
+    """
+    if image.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported image type '{image.content_type}'. "
+            f"Allowed: PNG, JPEG, WebP.",
+        )
+
+    image_data = await image.read()
+
+    if len(image_data) == 0:
+        raise HTTPException(status_code=400, detail="Image file is empty.")
+
+    if len(image_data) > settings.max_image_size_bytes:
+        limit_mb = settings.max_image_size_bytes // (1024 * 1024)
+        actual_mb = round(len(image_data) / (1024 * 1024), 1)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Image file size ({actual_mb} MB) exceeds {limit_mb} MB limit.",
+        )
+
+    if not validate_image(image_data):
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.")
+
+    warnings: list[str] = []
+    try:
+        _img = PILImage.open(io.BytesIO(image_data))
+        w, h = _img.size
+        if w > settings.max_image_dimension or h > settings.max_image_dimension:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Image dimensions ({w}x{h}) exceed {settings.max_image_dimension}px limit.",
+            )
+        if _img.mode == "RGBA":
+            warnings.append(
+                "Image has an alpha channel (RGBA). Some image providers handle "
+                "transparency inconsistently. Consider converting to RGB."
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # PIL validation already handled above
+
+    return image_data, warnings
+
+
 # ── Helper: persist results after each variant ─────────────────────
 
 
@@ -246,13 +364,24 @@ async def _process_job(job: Job) -> None:
             num_recommendations=len(job.recommendations),
         )
 
+        # Build runtime config from snapshot (per-job overrides) or global defaults
+        rc = None
+        if job.config_snapshot:
+            rc = RuntimeConfig(ConfigOverrides(**{
+                k: v for k, v in job.config_snapshot.items()
+                if k in ConfigOverrides.model_fields
+            }))
+        else:
+            rc = RuntimeConfig()
+
         await run_all_recommendations(
             image_b64=job.original_image_b64,
             recommendations=job.recommendations,
             brand_guidelines=job.brand_guidelines,
-            max_attempts=settings.max_retries,
+            max_attempts=rc.max_retries,
             job_results=job.results,
             on_variant_complete=lambda: _persist_results(job.job_id, job.results),
+            runtime_config=rc,
         )
         job.status = JobStatus.COMPLETED
         metrics.jobs_completed.labels(status="completed").inc()
@@ -323,55 +452,18 @@ async def create_job(
 
     Returns 202 immediately; the job is processed asynchronously.
     """
-    # -- Validate image type ------------------------------------------------
-    if image.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported image type '{image.content_type}'. "
-            f"Allowed: {ALLOWED_CONTENT_TYPES}",
-        )
-
-    image_data = await image.read()
-
-    # -- Validate file size ------------------------------------------------
-    if len(image_data) > settings.max_image_size_bytes:
-        limit_mb = settings.max_image_size_bytes // (1024 * 1024)
-        actual_mb = round(len(image_data) / (1024 * 1024), 1)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Image file size ({actual_mb} MB) exceeds {limit_mb} MB limit.",
-        )
-
-    # -- Validate image is decodable ---------------------------------------
-    if not validate_image(image_data):
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.")
-
-    # -- Validate image dimensions -----------------------------------------
-    import io as _io
-    from PIL import Image as _PILImage
-    try:
-        _img = _PILImage.open(_io.BytesIO(image_data))
-        w, h = _img.size
-        if w > settings.max_image_dimension or h > settings.max_image_dimension:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Image dimensions ({w}x{h}) exceed {settings.max_image_dimension}px limit.",
-            )
-        # Warn about RGBA in response headers (non-blocking)
-        _warnings: list[str] = []
-        if _img.mode == "RGBA":
-            _warnings.append("Image has an alpha channel (RGBA). Some image providers handle transparency inconsistently. Consider converting to RGB.")
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # PIL validation already handled above
+    # -- Validate image ------------------------------------------------------
+    image_data, _warnings = await _validate_image(image)
 
     # -- Parse and validate request body -----------------------------------
     body = await request_body.read()
     try:
         request = JobRequest.model_validate_json(body)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid request body: {exc}")
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid request body. Expected JSON with 'recommendations' (array) and 'brand_guidelines' (object).",
+        )
 
     if not request.recommendations:
         raise HTTPException(status_code=400, detail="At least one recommendation is required.")
@@ -383,21 +475,37 @@ async def create_job(
             detail=f"Too many recommendations ({len(request.recommendations)}). Maximum is {settings.max_recommendations}.",
         )
 
-    # -- Validate recommendation text length ------------------------------
-    for rec in request.recommendations:
-        if len(rec.description) > settings.max_recommendation_text_length:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Recommendation '{rec.id}' description ({len(rec.description)} chars) "
-                f"exceeds {settings.max_recommendation_text_length} character limit.",
-            )
+    # -- Validate recommendation fields -----------------------------------
+    _validate_recommendations(request.recommendations)
+    _validate_brand_guidelines(request.brand_guidelines)
 
     image_b64 = base64.b64encode(image_data).decode()
+
+    # Build runtime config from overrides (if any)
+    overrides = None
+    if request.config_overrides:
+        try:
+            overrides = ConfigOverrides(**{
+                k: v for k, v in request.config_overrides.items()
+                if k in ConfigOverrides.model_fields
+            })
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid config_overrides. Allowed fields: "
+                + ", ".join(sorted(ConfigOverrides.model_fields.keys())),
+            )
+        errors = overrides.validate_values()
+        if errors:
+            raise HTTPException(status_code=400, detail="; ".join(errors))
+    rc = RuntimeConfig(overrides)
+    config_snapshot = rc.snapshot()
 
     job = Job(
         original_image_b64=image_b64,
         recommendations=request.recommendations,
         brand_guidelines=request.brand_guidelines,
+        config_snapshot=config_snapshot,
     )
 
     # Persist to both in-memory store and database
@@ -410,6 +518,7 @@ async def create_job(
             original_image_b64=image_b64,
             recommendations=[r.model_dump() for r in request.recommendations],
             brand_guidelines=request.brand_guidelines.model_dump(),
+            config_snapshot=config_snapshot,
         )
 
     # Fire-and-forget: the polling endpoint exposes progress
@@ -436,10 +545,34 @@ async def get_job(job_id: str) -> JobResponse:
 
     Checks the in-memory store first (for active jobs), then falls back
     to the database (for jobs from previous sessions).
+    Adds live warnings (e.g. rate limiting) for running jobs.
     """
     job = _jobs.get(job_id)
     if job:
-        return job.to_response()
+        resp = job.to_response()
+        # Add live warnings for running jobs
+        if job.status in (JobStatus.RUNNING, JobStatus.PENDING):
+            rl = get_rate_limit_status()
+            if rl["any_limited"]:
+                limited = [
+                    f"{name} ({info['current_rpm']}/{info['default_rpm']} RPM)"
+                    for name, info in rl["providers"].items()
+                    if info["is_limited"]
+                ]
+                resp.warnings.append(
+                    "Rate limited (" + ", ".join(limited) + ") — generation may take longer than usual."
+                )
+        # Add per-recommendation warnings for all-failed
+        for rec in resp.results:
+            variants = rec.variants or []
+            if variants and all(v.status == "max_retries_exceeded" for v in variants):
+                total_attempts = sum(v.attempts for v in variants)
+                resp.warnings.append(
+                    f'All {len(variants)} variant(s) for "{rec.recommendation_title}" '
+                    f"failed after {total_attempts} total attempts. "
+                    "Try rephrasing the recommendation to be more specific or visually concrete."
+                )
+        return resp
 
     if db.is_enabled():
         row = await db.get_job(job_id)
@@ -513,13 +646,21 @@ async def metrics_summary() -> dict:
 async def cancel_job(job_id: str) -> dict:
     """Mark a job as cancelled. The background task will check this and stop."""
     job = _jobs.get(job_id)
-    if job and job.status in (JobStatus.PENDING, JobStatus.RUNNING):
-        job.status = JobStatus.FAILED
-        job.error = "Cancelled by user"
-        if db.is_enabled():
-            await db.update_job_status(job_id, "failed", error="Cancelled by user")
-        logger.info("job_cancelled", job_id=job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.status == JobStatus.COMPLETED:
+        return {"status": "already_completed", "message": "Job has already completed and cannot be cancelled."}
+    if job.status == JobStatus.FAILED:
+        return {"status": "already_failed", "message": "Job has already failed."}
+    job.status = JobStatus.FAILED
+    job.error = "Cancelled by user"
+    if db.is_enabled():
+        await db.update_job_status(job_id, "failed", error="Cancelled by user")
+    logger.info("job_cancelled", job_id=job_id)
     return {"status": "cancelled"}
+
+
+MAX_FEEDBACK_COMMENT_LENGTH = 2000
 
 
 @app.post("/api/v1/jobs/{job_id}/feedback")
@@ -533,26 +674,53 @@ async def submit_feedback(job_id: str, body: dict) -> dict:
     comment = body.get("comment")
 
     if feedback_type not in ("thumbs_up", "thumbs_down", "selected", "refinement"):
-        raise HTTPException(status_code=400, detail=f"Invalid feedback_type: {feedback_type}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid feedback_type '{feedback_type}'. "
+            "Must be one of: thumbs_up, thumbs_down, selected, refinement.",
+        )
     if not variant_id:
-        raise HTTPException(status_code=400, detail="variant_id is required")
+        raise HTTPException(status_code=400, detail="variant_id is required.")
+    if comment and len(comment) > MAX_FEEDBACK_COMMENT_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Comment too long ({len(comment)} chars). Maximum is {MAX_FEEDBACK_COMMENT_LENGTH}.",
+        )
 
-    # Look up variant context for the feedback record
+    # Look up the job — check in-memory first, then DB
+    job = _jobs.get(job_id)
+    if not job and db.is_enabled():
+        row = await db.get_job(job_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Job not found.")
+    elif not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    # Find the variant and extract context for the feedback record
     text_provider = image_provider = text_model = image_model = recommendation_type = None
     evaluation_score = None
+    variant_found = False
 
-    job = _jobs.get(job_id)
-    if job:
-        for rec in job.results:
-            for v in rec.variants:
-                if v.variant_id == variant_id:
-                    text_provider = v.text_provider
-                    image_provider = v.image_provider
-                    text_model = v.text_model
-                    image_model = v.image_model
-                    evaluation_score = v.evaluation_score
-                    recommendation_type = rec.recommendation_id
-                    break
+    results = job.results if job else [
+        RecommendationResult.model_validate(r) for r in (row.get("results") or [])
+    ]
+    for rec in results:
+        for v in rec.variants:
+            if v.variant_id == variant_id:
+                variant_found = True
+                text_provider = v.text_provider
+                image_provider = v.image_provider
+                text_model = v.text_model
+                image_model = v.image_model
+                evaluation_score = v.evaluation_score
+                recommendation_type = rec.recommendation_id
+                break
+
+    if not variant_found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Variant '{variant_id}' not found in job '{job_id}'.",
+        )
 
     if db.is_enabled():
         await db.save_feedback(
@@ -735,8 +903,6 @@ async def health() -> dict[str, str]:
 @app.get("/api/v1/thumb/{job_id}/{variant_id}")
 async def get_thumbnail(job_id: str, variant_id: str):
     """Return a small JPEG thumbnail for a variant image."""
-    import io as _io
-    from PIL import Image as _PILImage
     from fastapi.responses import Response
 
     job = _jobs.get(job_id)
@@ -753,18 +919,255 @@ async def get_thumbnail(job_id: str, variant_id: str):
     for rec in results:
         for v in rec.variants:
             if v.variant_id == variant_id and v.edited_image_b64:
-                img = _PILImage.open(_io.BytesIO(base64.b64decode(v.edited_image_b64)))
+                img = PILImage.open(io.BytesIO(base64.b64decode(v.edited_image_b64)))
                 img.thumbnail((300, 300))
-                buf = _io.BytesIO()
+                buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=50)
                 return Response(content=buf.getvalue(), media_type="image/jpeg")
 
     raise HTTPException(status_code=404, detail="Variant not found")
 
 
+# ── Experiment endpoints ────────────────────────────────────────────
+
+
+@app.post("/api/v1/experiments", status_code=201)
+async def create_experiment(body: dict) -> dict:
+    """Create a new experiment with named config variations.
+
+    Body: {"name": "...", "description": "...", "base_config": {...},
+           "variations": [{"name": "...", "config": {...}}, ...]}
+    """
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Experiment name is required.")
+    variations = body.get("variations", [])
+    if not variations:
+        raise HTTPException(status_code=400, detail="At least one variation is required.")
+    seen_names: set[str] = set()
+    for v in variations:
+        vname = (v.get("name") or "").strip()
+        if not vname:
+            raise HTTPException(status_code=400, detail="Each variation must have a name.")
+        if vname in seen_names:
+            raise HTTPException(status_code=400, detail=f"Duplicate variation name '{vname}'.")
+        seen_names.add(vname)
+        # Validate config overrides if present
+        config = v.get("config", {})
+        if config:
+            try:
+                ov = ConfigOverrides(**{k: val for k, val in config.items() if k in ConfigOverrides.model_fields})
+                errors = ov.validate_values()
+                if errors:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Variation '{vname}': {'; '.join(errors)}",
+                    )
+            except HTTPException:
+                raise
+            except Exception:
+                pass  # Unknown fields are ignored
+
+    experiment_id = uuid.uuid4().hex
+    base_config = body.get("base_config", {})
+    description = body.get("description")
+
+    if db.is_enabled():
+        await db.create_experiment(
+            experiment_id=experiment_id,
+            name=name,
+            description=description,
+            base_config=base_config,
+            variations=variations,
+        )
+
+    logger.info("experiment_created", experiment_id=experiment_id, name=name, num_variations=len(variations))
+    return {
+        "experiment_id": experiment_id,
+        "name": name,
+        "variations": len(variations),
+    }
+
+
+@app.get("/api/v1/experiments")
+async def list_experiments() -> dict:
+    """List all experiments."""
+    if db.is_enabled():
+        experiments = await db.list_experiments()
+        return {"experiments": experiments}
+    return {"experiments": []}
+
+
+@app.get("/api/v1/experiments/{experiment_id}")
+async def get_experiment(experiment_id: str) -> dict:
+    """Get experiment details including config variations."""
+    if not db.is_enabled():
+        raise HTTPException(status_code=404, detail="Database not configured")
+    exp = await db.get_experiment(experiment_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    return exp
+
+
+@app.post("/api/v1/experiments/{experiment_id}/run", status_code=202)
+async def run_experiment(
+    experiment_id: str,
+    image: UploadFile = File(...),
+    request_body: UploadFile = File(...),
+) -> dict:
+    """Run all variations of an experiment with the same input.
+
+    Creates one job per variation, all tagged with the experiment ID.
+    Accepts the same multipart form as POST /api/v1/jobs.
+    """
+    if not db.is_enabled():
+        raise HTTPException(status_code=400, detail="Database required for experiments")
+
+    exp = await db.get_experiment(experiment_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found.")
+    if exp["status"] == "running":
+        raise HTTPException(status_code=409, detail="Experiment is already running.")
+
+    # Validate image (same checks as create_job)
+    image_data, _ = await _validate_image(image)
+
+    body = await request_body.read()
+    try:
+        request = JobRequest.model_validate_json(body)
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid request body. Expected JSON with 'recommendations' (array) and 'brand_guidelines' (object).",
+        )
+    if not request.recommendations:
+        raise HTTPException(status_code=400, detail="At least one recommendation is required.")
+    _validate_recommendations(request.recommendations)
+    _validate_brand_guidelines(request.brand_guidelines)
+
+    image_b64 = base64.b64encode(image_data).decode()
+    base_config = exp.get("base_config", {})
+    job_ids = []
+
+    for variation in exp["variations"]:
+        # Merge base_config with variation-specific overrides
+        merged = {**base_config, **variation.get("config", {})}
+        overrides = ConfigOverrides(**{k: v for k, v in merged.items() if k in ConfigOverrides.model_fields})
+        rc = RuntimeConfig(overrides)
+        config_snapshot = rc.snapshot()
+
+        job = Job(
+            original_image_b64=image_b64,
+            recommendations=request.recommendations,
+            brand_guidelines=request.brand_guidelines,
+            config_snapshot=config_snapshot,
+            experiment_id=experiment_id,
+            variation_name=variation["name"],
+        )
+
+        _jobs[job.job_id] = job
+        await db.create_job(
+            job_id=job.job_id,
+            status=job.status.value,
+            created_at=job.created_at,
+            original_image_b64=image_b64,
+            recommendations=[r.model_dump() for r in request.recommendations],
+            brand_guidelines=request.brand_guidelines.model_dump(),
+            config_snapshot=config_snapshot,
+            experiment_id=experiment_id,
+            variation_name=variation["name"],
+        )
+
+        asyncio.create_task(_process_job(job))
+        metrics.jobs_submitted.inc()
+        job_ids.append({"job_id": job.job_id, "variation": variation["name"]})
+
+    await db.update_experiment_status(experiment_id, "running")
+    logger.info("experiment_started", experiment_id=experiment_id, num_jobs=len(job_ids))
+
+    return {
+        "experiment_id": experiment_id,
+        "jobs": job_ids,
+    }
+
+
+@app.get("/api/v1/experiments/{experiment_id}/results")
+async def get_experiment_results(experiment_id: str) -> dict:
+    """Compare results across all variations of an experiment.
+
+    Returns per-variation aggregates: acceptance rate, average score,
+    retry counts, and job status.
+    """
+    if not db.is_enabled():
+        raise HTTPException(status_code=400, detail="Database required for experiments")
+
+    exp = await db.get_experiment(experiment_id)
+    if not exp:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+
+    jobs = await db.get_experiment_jobs(experiment_id)
+
+    # Group jobs by variation
+    from collections import defaultdict
+    by_variation: dict[str, list] = defaultdict(list)
+    for j in jobs:
+        by_variation[j.get("variation_name", "unknown")].append(j)
+
+    variations = []
+    all_done = True
+    for var_name, var_jobs in by_variation.items():
+        total_variants = 0
+        accepted = 0
+        total_score = 0.0
+        total_attempts = 0
+        jobs_completed = 0
+        jobs_failed = 0
+        jobs_running = 0
+
+        for j in var_jobs:
+            if j["status"] in ("pending", "running"):
+                jobs_running += 1
+                all_done = False
+            elif j["status"] == "completed":
+                jobs_completed += 1
+            elif j["status"] == "failed":
+                jobs_failed += 1
+
+            for rec in (j.get("results") or []):
+                for v in rec.get("variants", []):
+                    total_variants += 1
+                    if v.get("status") == "accepted":
+                        accepted += 1
+                    total_score += v.get("evaluation_score") or 0.0
+                    total_attempts += v.get("attempts", 1)
+
+        variations.append({
+            "name": var_name,
+            "jobs": len(var_jobs),
+            "jobs_completed": jobs_completed,
+            "jobs_failed": jobs_failed,
+            "jobs_running": jobs_running,
+            "variants_total": total_variants,
+            "variants_accepted": accepted,
+            "acceptance_rate": round(accepted / total_variants, 3) if total_variants else 0,
+            "avg_score": round(total_score / total_variants, 3) if total_variants else 0,
+            "avg_attempts": round(total_attempts / total_variants, 1) if total_variants else 0,
+        })
+
+    # Update experiment status if all jobs are done
+    if all_done and jobs:
+        await db.update_experiment_status(experiment_id, "completed")
+
+    return {
+        "experiment_id": experiment_id,
+        "name": exp["name"],
+        "status": "completed" if (all_done and jobs) else "running" if jobs else "pending",
+        "variations": variations,
+    }
+
+
 # ── Static frontend ────────────────────────────────────────────────
-import pathlib as _pathlib
-_static_dir = _pathlib.Path(__file__).resolve().parent.parent / "static"
+_static_dir = pathlib.Path(__file__).resolve().parent.parent / "static"
 if _static_dir.is_dir():
     @app.get("/")
     async def root():
