@@ -1,0 +1,48 @@
+{
+  "image1": {
+    "filename": "creative_1.png",
+    "recommendations": [
+      {
+        "id": "rec_1",
+        "title": "Strengthen Headline Impact",
+        "description": "Add visual punch to the headline through enhanced color contrast, a soft gradient backdrop, or a geometric shape—without increasing its physical size. The moderate attention on the discount message suggests it needs more visual emphasis to register urgency and value immediately.",
+        "type": "contrast_salience"
+      },
+      {
+        "id": "rec_2",
+        "title": "Amplify Product Visibility",
+        "description": "Enhance color saturation and contrast in the jacket's yellow, blue, and pink panels, or add subtle highlights to emphasize garment construction. Human-face bias currently draws attention away from the merchandise; strengthening product definition will communicate quality more effectively in the critical opening seconds.",
+        "type": "contrast_salience"
+      },
+      {
+        "id": "rec_3",
+        "title": "Unify Logo and Headline",
+        "description": "Cluster the brand logo and headline together as a secondary focal point in the upper-right or center-right area. This reduces visual fragmentation on the left, allowing the model to command primary focus while brand messaging reinforces identity without delaying product discovery.",
+        "type": "composition"
+      }
+    ]
+  },
+  "image2": {
+    "filename": "creative_2.png",
+    "recommendations": [
+      {
+        "id": "rec_1",
+        "title": "Deepen Emotional Narrative with Lifestyle Context",
+        "description": "Refine product image styling and decorative elements to communicate a desired lifestyle or emotional state—such as freedom, discovery, or personal expression—rather than surface-level fun. This elevates emotional resonance and strengthens the motivational hook driving conversion action.",
+        "type": "colour_mood"
+      },
+      {
+        "id": "rec_2",
+        "title": "Reframe Headline for Conversion Motivation",
+        "description": "Shift from benefit-focused language to messaging that emphasizes discovery, personalization, or free trial exclusivity. Adding urgency or personal relevance moves viewers from passive interest to active consideration of the conversion action.",
+        "type": "copy_messaging"
+      },
+      {
+        "id": "rec_3",
+        "title": "Enhance Headline Visual Dominance",
+        "description": "Increase contrast between 'Enjoy your favorite songs on-demand' and the gradient background through bolder typography, increased letter spacing, or a semi-transparent panel. This ensures the headline captures attention within the first two seconds and serves as your primary conversion entry point.",
+        "type": "contrast_salience"
+      }
+    ]
+  }
+}

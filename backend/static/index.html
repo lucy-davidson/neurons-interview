@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visual Recommendations</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f9fafb; color: #111; line-height: 1.5; }
+.container { max-width: 1100px; margin: 0 auto; padding: 20px; }
+h1 { font-size: 1.6em; margin-bottom: 4px; }
+h2 { font-size: 1.2em; margin: 20px 0 10px; color: #333; }
+h3 { font-size: 1em; margin: 0 0 6px; }
+hr { border: none; border-top: 1px solid #e5e7eb; margin: 16px 0; }
+
+/* Health banner */
+#health-banner { display: none; background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; color: #991b1b; font-weight: 600; }
+
+/* Form */
+label { display: block; font-size: 0.85em; font-weight: 600; color: #555; margin-bottom: 4px; }
+select, input[type="file"], textarea, input[type="text"] {
+  width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px;
+  font-size: 0.9em; background: #fff; margin-bottom: 12px;
+}
+textarea { resize: vertical; }
+.row { display: flex; gap: 12px; }
+.row > * { flex: 1; }
+button.primary { background: #f97316; color: #fff; border: none; padding: 10px 24px; border-radius: 6px; font-size: 1em; font-weight: 600; cursor: pointer; width: 100%; }
+button.primary:hover { background: #ea580c; }
+button.primary:disabled { background: #ccc; cursor: not-allowed; }
+
+/* Status */
+#status-bar { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; margin: 16px 0; font-size: 0.9em; color: #555; }
+#status-bar.running { border-left: 4px solid #3b82f6; }
+#status-bar.completed { border-left: 4px solid #10b981; }
+#status-bar.failed { border-left: 4px solid #ef4444; }
+
+/* Results */
+.rec-group { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.rec-group h3 { color: #333; }
+.rec-group .subtitle { font-size: 0.85em; color: #888; margin-bottom: 10px; }
+.variants { display: flex; flex-wrap: wrap; gap: 14px; }
+.variant-card { flex: 0 0 260px; border: 1px solid #eee; border-radius: 6px; padding: 12px; background: #fafafa; }
+.variant-card h4 { font-size: 0.9em; margin: 0 0 4px; }
+.variant-card .desc { font-size: 0.8em; color: #666; margin-bottom: 8px; }
+.variant-card img { max-width: 100%; border-radius: 4px; cursor: pointer; }
+.variant-card .meta { font-size: 0.8em; margin-top: 6px; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; color: #fff; font-size: 0.8em; }
+.badge.accepted { background: #10b981; }
+.badge.failed { background: #ef4444; }
+.feedback-btns { margin-top: 8px; display: flex; gap: 5px; flex-wrap: wrap; }
+.feedback-btns button { padding: 3px 8px; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; font-size: 0.78em; background: #fff; }
+.feedback-btns button.use { background: #3b82f6; color: #fff; border-color: #3b82f6; }
+.feedback-btns button:disabled { opacity: 0.5; cursor: default; }
+.spinner { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 150px; border: 1px dashed #ccc; border-radius: 6px; flex: 0 0 260px; color: #999; font-size: 0.85em; }
+.spinner .gear { font-size: 1.4em; animation: spin 2s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.error-msg { background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; padding: 10px; color: #991b1b; font-size: 0.85em; margin-bottom: 10px; }
+
+/* Lightbox */
+#lightbox { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); z-index: 9999; cursor: pointer; justify-content: center; align-items: center; }
+#lightbox img { max-width: 90%; max-height: 90%; border-radius: 8px; }
+
+/* Image preview */
+#image-preview { max-height: 200px; border-radius: 6px; margin-bottom: 12px; }
+#rec-table td input { width: 100%; border: none; padding: 6px 10px; font-size: 0.85em; background: transparent; }
+#rec-table td input:focus { outline: 2px solid #3b82f6; border-radius: 3px; }
+#rec-table td { border-bottom: 1px solid #eee; }
+#rec-table .remove-btn { border: none; background: none; cursor: pointer; color: #aaa; font-size: 1.1em; }
+#rec-table .remove-btn:hover { color: #ef4444; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Visual Recommendations</h1>
+  <p style="color:#888;font-size:0.85em;margin-bottom:12px;">Upload a creative, add recommendations, and generate visual variants.</p>
+
+  <div id="health-banner">&#9888; Backend is unreachable. Check that the service is running.</div>
+
+  <hr>
+
+  <!-- Input -->
+  <label for="sample-select">Load Sample Data</label>
+  <select id="sample-select">
+    <option value="">-- Select --</option>
+    <option value="creative_1">creative_1</option>
+    <option value="creative_2">creative_2</option>
+  </select>
+
+  <label for="image-input">Upload Creative (PNG / JPEG / WebP)</label>
+  <input type="file" id="image-input" accept="image/png,image/jpeg,image/webp">
+  <img id="image-preview" style="display:none;">
+
+  <label>Recommendations</label>
+  <div style="overflow-x:auto;margin-bottom:12px;">
+    <table id="rec-table" style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #d1d5db;border-radius:6px;">
+      <thead>
+        <tr style="background:#f3f4f6;">
+          <th style="text-align:left;padding:6px 10px;border-bottom:1px solid #d1d5db;width:60px;">ID</th>
+          <th style="text-align:left;padding:6px 10px;border-bottom:1px solid #d1d5db;width:180px;">Title</th>
+          <th style="text-align:left;padding:6px 10px;border-bottom:1px solid #d1d5db;">Description</th>
+          <th style="text-align:left;padding:6px 10px;border-bottom:1px solid #d1d5db;width:100px;">Type</th>
+          <th style="width:30px;border-bottom:1px solid #d1d5db;"></th>
+        </tr>
+      </thead>
+      <tbody id="rec-tbody"></tbody>
+    </table>
+  </div>
+  <button type="button" onclick="addRecRow()" style="padding:4px 12px;border:1px solid #d1d5db;border-radius:4px;background:#fff;cursor:pointer;font-size:0.85em;">+ Add recommendation</button>
+
+  <h2>Brand Guidelines</h2>
+  <label>Protected Regions (semicolon-separated)</label>
+  <input type="text" id="bg-protected" placeholder="Do not modify the brand logo; Do not alter the model's face">
+  <label>Typography</label>
+  <input type="text" id="bg-typography" placeholder="Maintain existing font style and hierarchy">
+  <div class="row">
+    <div><label>Aspect Ratio</label><input type="text" id="bg-aspect" placeholder="Maintain original aspect ratio"></div>
+    <div><label>Brand Elements</label><input type="text" id="bg-elements" placeholder="Ensure logo remains visible"></div>
+  </div>
+
+  <div style="display:flex;gap:10px;">
+    <button class="primary" id="submit-btn" onclick="submitJob()" style="flex:1;">Submit Job</button>
+    <button id="cancel-btn" onclick="cancelJob()" style="flex:0;padding:10px 24px;border:1px solid #ef4444;border-radius:6px;background:#fff;color:#ef4444;font-weight:600;cursor:pointer;display:none;">Cancel</button>
+  </div>
+
+  <!-- Status -->
+  <div id="status-bar" style="display:none;"></div>
+
+  <h2>Results</h2>
+  <div id="results"></div>
+</div>
+
+<!-- Lightbox -->
+<div id="lightbox" onclick="this.style.display='none'"><img id="lightbox-img"></div>
+
+<script>
+const API = '';  // same origin since served from FastAPI
+
+// ── Sample data ──────────────────────────────────────────────────────
+const SAMPLES = {
+  creative_1: {
+    image: '/static/samples/creative_1.png',
+    recommendations: [
+      {id:"rec_1",title:"Strengthen Headline Impact",description:"Add visual punch to the headline through enhanced color contrast, a soft gradient backdrop, or a geometric shape—without increasing its physical size.",type:"contrast_salience"},
+      {id:"rec_2",title:"Amplify Product Visibility",description:"Enhance color saturation and contrast in the jacket's yellow, blue, and pink panels, or add subtle highlights to emphasize garment construction.",type:"contrast_salience"},
+      {id:"rec_3",title:"Unify Logo and Headline",description:"Cluster the brand logo and headline together as a secondary focal point in the upper-right or center-right area.",type:"composition"}
+    ],
+    brand: {protected:"Do not modify or remove the brand logo; Do not alter the model's face",typography:"Maintain existing font style and hierarchy for all text elements",aspect:"Maintain original aspect ratio (1572x1720)",elements:"Ensure logo remains visible and legible at all times"}
+  },
+  creative_2: {
+    image: '/static/samples/creative_2.png',
+    recommendations: [
+      {id:"rec_1",title:"Deepen Emotional Narrative with Lifestyle Context",description:"Refine product image styling and decorative elements to communicate a desired lifestyle or emotional state.",type:"colour_mood"},
+      {id:"rec_2",title:"Reframe Headline for Conversion Motivation",description:"Shift from benefit-focused language to messaging that emphasizes discovery, personalization, or free trial exclusivity.",type:"copy_messaging"},
+      {id:"rec_3",title:"Enhance Headline Visual Dominance",description:"Increase contrast between the headline and the gradient background through bolder typography, increased letter spacing, or a semi-transparent panel.",type:"contrast_salience"}
+    ],
+    brand: {protected:"Do not modify or remove the brand logo; Do not alter the product imagery (headphones)",typography:"Maintain existing font style; text modifications should preserve readability",aspect:"Maintain original aspect ratio (636x1063)",elements:"Product imagery must remain the focal point of the composition"}
+  }
+};
+
+// ── State ────────────────────────────────────────────────────────────
+let currentJobId = localStorage.getItem('visrec_job_id') || '';
+let feedbackGiven = JSON.parse(localStorage.getItem('visrec_feedback') || '{}');
+let pollTimer = null;
+let selectedFile = null;
+
+// ── Init ─────────────────────────────────────────────────────────────
+document.getElementById('sample-select').addEventListener('change', function() {
+  const s = SAMPLES[this.value];
+  if (!s) return;
+  setRecTable(s.recommendations);
+  document.getElementById('bg-protected').value = s.brand.protected;
+  document.getElementById('bg-typography').value = s.brand.typography;
+  document.getElementById('bg-aspect').value = s.brand.aspect;
+  document.getElementById('bg-elements').value = s.brand.elements;
+  // Load sample image
+  const preview = document.getElementById('image-preview');
+  preview.style.display = 'block';
+  // Load sample image and create a File for upload
+  const sampleName = this.value;
+  fetch(s.image).then(r => r.blob()).then(blob => {
+    selectedFile = new File([blob], sampleName + '.png', {type: 'image/png'});
+    preview.src = URL.createObjectURL(blob);
+  }).catch(() => {
+    preview.src = s.image;
+  });
+});
+
+document.getElementById('image-input').addEventListener('change', function() {
+  selectedFile = this.files[0];
+  if (selectedFile) {
+    const preview = document.getElementById('image-preview');
+    preview.src = URL.createObjectURL(selectedFile);
+    preview.style.display = 'block';
+  }
+});
+
+// Restore last job on load
+if (currentJobId) {
+  fetchAndRender(currentJobId);
+}
+
+// Health check
+setInterval(checkHealth, 10000);
+checkHealth();
+
+// ── Recommendations table ────────────────────────────────────────────
+function addRecRow(id, title, desc, type) {
+  const tbody = document.getElementById('rec-tbody');
+  const tr = document.createElement('tr');
+  tr.innerHTML =
+    '<td><input type="text" placeholder="rec_1" value="' + esc(id||'') + '"></td>' +
+    '<td><input type="text" placeholder="Title" value="' + esc(title||'') + '"></td>' +
+    '<td><input type="text" placeholder="Description" value="' + esc(desc||'') + '"></td>' +
+    '<td><input type="text" placeholder="Type" value="' + esc(type||'') + '"></td>' +
+    '<td><button class="remove-btn" onclick="this.closest(\'tr\').remove()">&times;</button></td>';
+  tbody.appendChild(tr);
+}
+
+function setRecTable(recs) {
+  document.getElementById('rec-tbody').innerHTML = '';
+  for (const r of recs) addRecRow(r.id, r.title, r.description, r.type);
+}
+
+function getRecsFromTable() {
+  const rows = document.querySelectorAll('#rec-tbody tr');
+  const recs = [];
+  rows.forEach(tr => {
+    const inputs = tr.querySelectorAll('input');
+    const id = inputs[0].value.trim();
+    const title = inputs[1].value.trim();
+    const desc = inputs[2].value.trim();
+    const type = inputs[3].value.trim();
+    if (id || title) recs.push({id, title, description: desc, type});
+  });
+  return recs;
+}
+
+// ── Submit ───────────────────────────────────────────────────────────
+async function submitJob() {
+  if (!selectedFile) return alert('Please upload or select an image.');
+  const recs = getRecsFromTable();
+  if (recs.length === 0) return alert('Please add at least one recommendation.');
+
+  const bg = {
+    protected_regions: document.getElementById('bg-protected').value.split(';').map(s=>s.trim()).filter(Boolean),
+    typography: document.getElementById('bg-typography').value.trim(),
+    aspect_ratio: document.getElementById('bg-aspect').value.trim(),
+    brand_elements: document.getElementById('bg-elements').value.trim(),
+  };
+
+  const body = JSON.stringify({recommendations: recs, brand_guidelines: bg});
+  const form = new FormData();
+  form.append('image', selectedFile);
+  form.append('request_body', new Blob([body], {type:'application/json'}), 'request.json');
+
+  document.getElementById('submit-btn').disabled = true;
+  document.getElementById('cancel-btn').style.display = 'block';
+  setStatus('Submitting...', 'running');
+
+  try {
+    const resp = await fetch(API + '/api/v1/jobs', {method:'POST', body: form});
+    if (!resp.ok) {
+      const err = await resp.json();
+      setStatus('Error: ' + (err.detail || resp.statusText), 'failed');
+      document.getElementById('submit-btn').disabled = false;
+      document.getElementById('cancel-btn').style.display = 'none';
+      return;
+    }
+    const data = await resp.json();
+    currentJobId = data.job_id;
+    localStorage.setItem('visrec_job_id', currentJobId);
+    feedbackGiven = {};
+    localStorage.setItem('visrec_feedback', '{}');
+    startPolling();
+  } catch(e) {
+    setStatus('Network error: ' + e.message, 'failed');
+    document.getElementById('submit-btn').disabled = false;
+    document.getElementById('cancel-btn').style.display = 'none';
+  }
+}
+
+// ── Polling ──────────────────────────────────────────────────────────
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => fetchAndRender(currentJobId), 3000);
+  fetchAndRender(currentJobId);
+}
+
+async function fetchAndRender(jobId) {
+  try {
+    const resp = await fetch(API + '/api/v1/jobs/' + jobId);
+    if (!resp.ok) { setStatus('Job not found', 'failed'); stopPolling(); return; }
+    const data = await resp.json();
+    renderResults(data);
+
+    const isRunning = data.status === 'pending' || data.status === 'running';
+    const accepted = countAccepted(data.results);
+    const total = data.results.length;
+    const recsWithVariants = data.results.filter(r => r.variants && r.variants.length > 0).length;
+
+    if (isRunning) {
+      let stage = accepted === 0 ? 'Generating...' : accepted + ' variant(s) ready';
+      setStatus('Running — ' + stage + ' (' + recsWithVariants + '/' + total + ' recommendations in progress)', 'running');
+    } else if (data.status === 'completed') {
+      setStatus('Completed — ' + accepted + ' variant(s) across ' + total + ' recommendation(s)', 'completed');
+      jobFinished();
+    } else if (data.status === 'failed') {
+      setStatus('Failed: ' + (data.error || 'Unknown error'), 'failed');
+      jobFinished();
+    } else if (data.status === 'cancelled') {
+      setStatus('Cancelled', 'failed');
+      jobFinished();
+    }
+  } catch(e) {
+    // Network error during poll -- keep trying
+  }
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+function jobFinished() {
+  stopPolling();
+  document.getElementById('submit-btn').disabled = false;
+  document.getElementById('cancel-btn').style.display = 'none';
+}
+
+async function cancelJob() {
+  if (!currentJobId) return;
+  stopPolling();
+  try {
+    await fetch(API + '/api/v1/jobs/' + currentJobId + '/cancel', {method: 'POST'});
+  } catch(e) { /* best effort */ }
+  setStatus('Cancelled — you can submit a new job', 'failed');
+  jobFinished();
+}
+
+function countAccepted(results) {
+  let n = 0;
+  for (const r of results) for (const v of (r.variants||[])) if (v.status === 'accepted') n++;
+  return n;
+}
+
+// ── Render ───────────────────────────────────────────────────────────
+function renderResults(data) {
+  const el = document.getElementById('results');
+  const results = data.results || [];
+  const isRunning = data.status === 'running' || data.status === 'pending';
+  const jobId = data.job_id;
+
+  let html = '';
+  for (const rec of results) {
+    const variants = (rec.variants || []).filter(v => v.status === 'accepted');
+    const failedCount = (rec.variants || []).length - variants.length;
+    const allDone = !isRunning && rec.variants && rec.variants.length > 0;
+    const allFailed = allDone && variants.length === 0 && failedCount > 0;
+
+    let subtitle = '';
+    if (isRunning && rec.variants.length === 0) subtitle = 'Generating variant ideas...';
+    else if (variants.length > 0) {
+      subtitle = variants.length + ' variant(s) generated';
+      if (failedCount > 0) subtitle += ' (' + failedCount + " didn't meet quality threshold)";
+    } else if (allFailed) subtitle = 'All variants failed quality checks';
+    else subtitle = 'Processing...';
+
+    html += '<div class="rec-group"><h3>' + esc(rec.recommendation_title) + '</h3>';
+    html += '<div class="subtitle">' + subtitle + '</div>';
+
+    if (allFailed) {
+      html += '<div class="error-msg">&#9888; None of the generated variants passed quality review. Try rephrasing the recommendation.</div>';
+    }
+
+    html += '<div class="variants">';
+    for (const v of variants) {
+      const score = v.evaluation_score != null ? v.evaluation_score.toFixed(2) : 'N/A';
+      html += '<div class="variant-card">';
+      html += '<h4>' + esc(v.variant_title) + '</h4>';
+      html += '<div class="desc">' + esc(v.variant_description) + '</div>';
+      if (v.edited_image_b64) {
+        html += '<img src="/api/v1/thumb/' + jobId + '/' + v.variant_id + '" onclick="openLightbox(\'' + jobId + '\',\'' + v.variant_id + '\')" title="Click to enlarge">';
+      }
+      html += '<div class="meta"><span class="badge accepted">accepted</span> Score: ' + score + ' | Attempts: ' + v.attempts + '</div>';
+      html += renderFeedbackButtons(jobId, v.variant_id);
+      html += '</div>';
+    }
+
+    const TARGET_VARIANTS = 2;
+    const needsMore = isRunning && !allFailed && variants.length < TARGET_VARIANTS;
+    if (needsMore) {
+      html += '<div class="spinner"><div class="gear">&#9881;</div>Working on next variant...</div>';
+    }
+    html += '</div></div>';
+  }
+
+  el.innerHTML = html;
+}
+
+function renderFeedbackButtons(jobId, variantId) {
+  const types = [
+    {type:'thumbs_up', label:'&#128077; Like', cls:''},
+    {type:'thumbs_down', label:'&#128078; Dislike', cls:''},
+    {type:'refinement', label:'&#9998; Refine', cls:''},
+    {type:'selected', label:'&#10003; Use this', cls:' use'},
+  ];
+  let html = '<div class="feedback-btns">';
+  for (const t of types) {
+    const key = jobId + ':' + variantId + ':' + t.type;
+    const done = feedbackGiven[key];
+    const label = done ? '&#10003;' : t.label;
+    html += '<button class="' + t.cls + '"' + (done ? ' disabled' : '') +
+      ' onclick="sendFeedback(\'' + jobId + '\',\'' + variantId + '\',\'' + t.type + '\',this)">' + label + '</button>';
+  }
+  return html + '</div>';
+}
+
+// ── Feedback ─────────────────────────────────────────────────────────
+async function sendFeedback(jobId, variantId, type, btn) {
+  const key = jobId + ':' + variantId + ':' + type;
+  if (feedbackGiven[key]) return;
+  let comment = null;
+  if (type === 'refinement') {
+    comment = prompt('What would you change?');
+    if (!comment) return;
+  }
+  try {
+    await fetch(API + '/api/v1/jobs/' + jobId + '/feedback', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({variant_id: variantId, feedback_type: type, comment: comment})
+    });
+    feedbackGiven[key] = true;
+    localStorage.setItem('visrec_feedback', JSON.stringify(feedbackGiven));
+    btn.disabled = true;
+    btn.innerHTML = '&#10003;';
+  } catch(e) { alert('Failed to send feedback'); }
+}
+
+// ── Lightbox ─────────────────────────────────────────────────────────
+async function openLightbox(jobId, variantId) {
+  const lb = document.getElementById('lightbox');
+  const img = document.getElementById('lightbox-img');
+  img.src = '';
+  lb.style.display = 'flex';
+  try {
+    const resp = await fetch(API + '/api/v1/jobs/' + jobId + '/image/' + variantId);
+    const data = await resp.json();
+    img.src = 'data:image/png;base64,' + data.image_b64;
+  } catch(e) { lb.style.display = 'none'; }
+}
+
+// ── Health ────────────────────────────────────────────────────────────
+async function checkHealth() {
+  try {
+    const resp = await fetch(API + '/health');
+    document.getElementById('health-banner').style.display = resp.ok ? 'none' : 'block';
+  } catch(e) {
+    document.getElementById('health-banner').style.display = 'block';
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────
+function setStatus(msg, cls) {
+  const bar = document.getElementById('status-bar');
+  bar.textContent = msg;
+  bar.className = cls;
+  bar.style.display = 'block';
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>

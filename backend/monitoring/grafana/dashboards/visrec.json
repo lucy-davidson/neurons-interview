@@ -1,0 +1,336 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Jobs Submitted (rate/min)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(visrec_jobs_submitted_total[1m]) * 60",
+          "legendFormat": "submitted/min"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Jobs Completed vs Failed (rate/min)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(visrec_jobs_completed_total{status=\"completed\"}[1m]) * 60",
+          "legendFormat": "completed/min"
+        },
+        {
+          "expr": "rate(visrec_jobs_completed_total{status=\"failed\"}[1m]) * 60",
+          "legendFormat": "failed/min"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "failed/min" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Active Jobs",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "visrec_jobs_in_progress",
+          "legendFormat": "in progress"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 3 },
+              { "color": "red", "value": 5 }
+            ]
+          },
+          "min": 0,
+          "max": 10
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Variant Acceptance Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(visrec_variants_processed_total{status=\"accepted\"}[5m]) / (rate(visrec_variants_processed_total{status=\"accepted\"}[5m]) + rate(visrec_variants_processed_total{status=\"max_retries_exceeded\"}[5m]) + rate(visrec_variants_processed_total{status=\"error\"}[5m]))",
+          "legendFormat": "acceptance rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "green", "mode": "fixed" },
+          "custom": { "lineWidth": 2, "fillOpacity": 20 },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Critic Scores Distribution",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "visrec_variant_score_bucket",
+          "legendFormat": "{{le}}",
+          "format": "heatmap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "LLM Call Duration (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(visrec_llm_call_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(visrec_llm_call_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(visrec_llm_call_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "LLM Calls by Provider (rate/min)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(visrec_llm_calls_total[1m]) * 60",
+          "legendFormat": "{{provider}} / {{call_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Agent Invocations (rate/min)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(visrec_agent_invocations_total[1m]) * 60",
+          "legendFormat": "{{agent}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Errors & Parse Failures (rate/min)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(visrec_llm_errors_total[1m]) * 60",
+          "legendFormat": "llm_error: {{provider}}/{{call_type}}"
+        },
+        {
+          "expr": "rate(visrec_llm_parse_failures_total[1m]) * 60",
+          "legendFormat": "parse_fail: {{agent}}"
+        },
+        {
+          "expr": "rate(visrec_provider_fallbacks_total[1m]) * 60",
+          "legendFormat": "fallback: {{primary}}→{{fallback}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Plan Revisions (rate/min)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 32 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(visrec_plan_revisions_total[5m]) * 60",
+          "legendFormat": "revisions/min"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }] } },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Provider Fallbacks (total)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 32 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(visrec_provider_fallbacks_total)",
+          "legendFormat": "total fallbacks"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }] } },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Avg Retry Attempts per Variant",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 32 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(visrec_variant_attempts_sum[5m]) / rate(visrec_variant_attempts_count[5m])",
+          "legendFormat": "avg attempts"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 1, "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 2 }] } },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Avg Critic Score",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 32 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(visrec_variant_score_sum[5m]) / rate(visrec_variant_score_count[5m])",
+          "legendFormat": "avg score"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "decimals": 2, "color": { "mode": "thresholds" }, "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] } },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Dependency Health",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 36 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "visrec_dependency_up",
+          "legendFormat": "{{dependency}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "title": "Dependency Latency (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 36 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "visrec_dependency_latency_ms",
+          "legendFormat": "{{dependency}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["visrec", "mlops"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "5s",
+  "title": "Visual Recommendations -- System Dashboard",
+  "uid": "visrec-main"
+}
