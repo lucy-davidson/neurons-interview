@@ -189,10 +189,12 @@ backend/
 │   ├── grafana/             # Dashboard + datasource provisioning
 │   └── pgadmin/             # Auto-connect config
 ├── Dockerfile
-├── docker-compose.yml       # 5 services
 ├── requirements.txt
 ├── .env.example
 └── .gitignore
+```
+
+`docker-compose.yml` is at the project root (one level up).
 
 ## Design Decisions
 
