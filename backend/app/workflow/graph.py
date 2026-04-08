@@ -97,6 +97,8 @@ async def _run_variant(
     runtime_config: Any | None = None,
 ) -> VariantResult:
     """Execute the edit-evaluate-refine loop for one variant idea."""
+    import time as _time
+
     initial_state: RecommendationState = {
         "original_image_b64": image_b64,
         "recommendation_id": recommendation.id,
@@ -119,6 +121,10 @@ async def _run_variant(
         "max_attempts": max_attempts,
         "audit_trail": [],
         "status": "",
+        "agent_timings": [],
+        "critic_evaluations": [],
+        "total_tokens": 0,
+        "total_cost_usd": 0.0,
     }
 
     logger.info(
@@ -128,9 +134,24 @@ async def _run_variant(
         variant_title=variant["title"],
     )
 
+    variant_start = _time.monotonic()
     final_state = await _compiled_graph.ainvoke(initial_state)
+    variant_duration = _time.monotonic() - variant_start
 
     status = "accepted" if final_state.get("evaluation_passed") else "max_retries_exceeded"
+    total_tokens = final_state.get("total_tokens") or 0
+    total_cost = final_state.get("total_cost_usd") or 0.0
+
+    metrics.variant_duration.observe(variant_duration)
+    logger.info(
+        "variant_duration",
+        variant_id=variant_id,
+        duration_s=round(variant_duration, 2),
+        total_tokens=total_tokens,
+        total_cost_usd=round(total_cost, 6),
+        attempts=final_state.get("attempt", 1),
+        final_status=status,
+    )
 
     # Use runtime_config if available, fall back to global settings
     from app.config import settings as _settings
@@ -142,6 +163,9 @@ async def _run_variant(
         if _settings.text_provider != "claude" else _settings.claude_vision_model
     )
     image_model = rc.image_model if rc else getattr(_settings, f"{_settings.image_provider}_image_model", _settings.image_provider)
+
+    # Import prompt versions lazily to avoid circular imports
+    from app.workflow.prompt_versions import PROMPT_VERSIONS
 
     return VariantResult(
         variant_id=variant_id,
@@ -157,6 +181,12 @@ async def _run_variant(
         image_provider=image_provider,
         text_model=text_model,
         image_model=image_model,
+        duration_s=round(variant_duration, 2),
+        total_tokens=total_tokens,
+        total_cost_usd=round(total_cost, 6),
+        agent_timings=final_state.get("agent_timings", []),
+        prompt_versions=PROMPT_VERSIONS,
+        critic_evaluations=final_state.get("critic_evaluations", []),
     )
 
 

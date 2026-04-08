@@ -1120,9 +1120,13 @@ async def get_experiment_results(experiment_id: str) -> dict:
         accepted = 0
         total_score = 0.0
         total_attempts = 0
+        total_duration = 0.0
+        total_tokens = 0
+        total_cost = 0.0
         jobs_completed = 0
         jobs_failed = 0
         jobs_running = 0
+        prompt_versions = {}
 
         for j in var_jobs:
             if j["status"] in ("pending", "running"):
@@ -1140,6 +1144,11 @@ async def get_experiment_results(experiment_id: str) -> dict:
                         accepted += 1
                     total_score += v.get("evaluation_score") or 0.0
                     total_attempts += v.get("attempts", 1)
+                    total_duration += v.get("duration_s") or 0.0
+                    total_tokens += v.get("total_tokens") or 0
+                    total_cost += v.get("total_cost_usd") or 0.0
+                    if v.get("prompt_versions") and not prompt_versions:
+                        prompt_versions = v["prompt_versions"]
 
         variations.append({
             "name": var_name,
@@ -1152,6 +1161,10 @@ async def get_experiment_results(experiment_id: str) -> dict:
             "acceptance_rate": round(accepted / total_variants, 3) if total_variants else 0,
             "avg_score": round(total_score / total_variants, 3) if total_variants else 0,
             "avg_attempts": round(total_attempts / total_variants, 1) if total_variants else 0,
+            "avg_duration_s": round(total_duration / total_variants, 1) if total_variants else 0,
+            "total_tokens": total_tokens,
+            "total_cost_usd": round(total_cost, 4),
+            "prompt_versions": prompt_versions,
         })
 
     # Update experiment status if all jobs are done

@@ -172,11 +172,14 @@ backend/
 │   ├── metrics.py           # Prometheus counters, histograms, gauges
 │   ├── services/
 │   │   ├── image.py         # Image validation (PIL)
-│   │   └── llm.py           # LLM abstraction (3 providers) + adaptive rate limiting
+│   │   ├── llm.py           # LLM abstraction (3 providers) + adaptive rate limiting + token tracking
+│   │   └── cost.py          # Per-model cost estimation tables
 │   └── workflow/
 │       ├── state.py         # LangGraph state definition
-│       ├── graph.py         # Pool-and-batch orchestration
+│       ├── graph.py         # Pool-and-batch orchestration + variant duration tracking
+│       ├── prompt_versions.py # SHA-256 hashes of all agent prompts
 │       └── agents/
+│           ├── __init__.py  # timed_agent decorator (duration + token tracking)
 │           ├── ideator.py   # Recommendation → 10 variant ideas with edit prompts
 │           ├── idea_critic.py # Idea quality gate (rejects subtle/duplicate)
 │           ├── editor.py    # Edit prompt → edited image

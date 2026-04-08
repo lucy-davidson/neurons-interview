@@ -42,3 +42,9 @@ class RecommendationState(TypedDict, total=False):
     max_attempts: int
     audit_trail: list[AuditEntry]
     status: str  # "accepted" | "max_retries_exceeded"
+
+    # -- Tracking fields (accumulated during workflow) -------------------
+    agent_timings: list[dict]
+    critic_evaluations: list[dict]
+    total_tokens: int
+    total_cost_usd: float

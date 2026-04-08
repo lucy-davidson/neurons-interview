@@ -12,11 +12,13 @@ import structlog
 from app import metrics
 from app.models import AuditEntry
 from app.services.llm import edit_image
+from app.workflow.agents import timed_agent
 from app.workflow.state import RecommendationState
 
 logger = structlog.get_logger()
 
 
+@timed_agent("editor")
 async def run_editor(state: RecommendationState) -> RecommendationState:
     """Generate an edited image using the ideator's edit prompt."""
     metrics.agent_invocations.labels(agent="editor").inc()

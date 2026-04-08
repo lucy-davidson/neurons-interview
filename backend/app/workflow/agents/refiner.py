@@ -12,6 +12,7 @@ import structlog
 from app import metrics
 from app.models import AuditEntry
 from app.services.llm import vision_chat
+from app.workflow.agents import timed_agent
 from app.workflow.state import RecommendationState
 
 logger = structlog.get_logger()
@@ -34,6 +35,7 @@ Keep the revised prompt to 1-3 sentences.
 """
 
 
+@timed_agent("refiner")
 async def run_refiner(state: RecommendationState) -> RecommendationState:
     """Produce a revised edit_prompt based on critic feedback and increment the attempt counter."""
     metrics.agent_invocations.labels(agent="refiner").inc()

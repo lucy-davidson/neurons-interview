@@ -103,3 +103,42 @@ provider_fallbacks = Counter(
     "Times the system fell back from primary to alternate LLM provider",
     ["primary", "fallback", "call_type"],  # e.g. ("openai", "gemini", "vision_chat")
 )
+
+# ── Agent-level timing ───────────────────────────────────────────────
+
+agent_duration = Histogram(
+    "visrec_agent_duration_seconds",
+    "Duration of individual agent invocations",
+    ["agent"],
+    buckets=[0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180],
+)
+
+# ── Token usage ──────────────────────────────────────────────────────
+
+llm_tokens_total = Counter(
+    "visrec_llm_tokens_total",
+    "Total tokens consumed by LLM calls",
+    ["provider", "call_type", "token_type"],  # token_type: "prompt" | "completion"
+)
+
+agent_tokens = Counter(
+    "visrec_agent_tokens_total",
+    "Total tokens consumed per agent invocation",
+    ["agent", "token_type"],
+)
+
+# ── Variant-level timing ─────────────────────────────────────────────
+
+variant_duration = Histogram(
+    "visrec_variant_duration_seconds",
+    "Wall clock time per variant through the edit-evaluate-refine loop",
+    buckets=[5, 10, 30, 60, 120, 300, 600],
+)
+
+# ── Cost estimation ──────────────────────────────────────────────────
+
+llm_estimated_cost = Counter(
+    "visrec_llm_estimated_cost_usd",
+    "Estimated cost in USD of LLM API usage",
+    ["provider", "call_type"],
+)

@@ -78,6 +78,13 @@ class VariantResult(BaseModel):
     image_provider: str = ""
     text_model: str = ""
     image_model: str = ""
+    # Experiment tracking (duration, tokens, cost, agent breakdown)
+    duration_s: float | None = None
+    total_tokens: int | None = None
+    total_cost_usd: float | None = None
+    agent_timings: list[dict] = Field(default_factory=list)
+    prompt_versions: dict[str, str] = Field(default_factory=dict)
+    critic_evaluations: list[dict] = Field(default_factory=list)
 
 
 class RecommendationResult(BaseModel):

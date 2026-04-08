@@ -72,11 +72,11 @@ Static HTML/JS served by FastAPI. No framework, no build step. Sample data pre-l
 
 **PostgreSQL persistence** — jobs survive backend restarts. A heartbeat system (updated every 30s) catches orphaned jobs — if a worker crashes, a background sweep marks the job as failed after 5 minutes. Results are written to the DB incrementally as each variant completes.
 
-**Observability** — Prometheus metrics for everything (job lifecycle, LLM latency by provider, variant acceptance rates, parse failures, fallback counts). Grafana dashboard with 14 panels, auto-provisioned on first boot. Dependency health checks ping all three LLM providers and PostgreSQL every 30 seconds.
+**Observability** — Prometheus metrics for everything (job lifecycle, LLM latency by provider, variant acceptance rates, parse failures, fallback counts, token usage, cost estimates). Per-agent duration tracking and structured critic evaluation logging. Grafana dashboard with 14 panels, auto-provisioned on first boot. Dependency health checks ping all three LLM providers and PostgreSQL every 30 seconds.
 
 **User feedback** — like/dislike/refine/use-this buttons on each variant. Stored in PostgreSQL with the provider, model, and critic score for later analysis. The idea is to eventually use this to calibrate the critic and tune the ideator prompts.
 
-**Experiment scaffolding** — per-job config overrides let you change the provider, model, or workflow parameters (retries, variant count) without restarting the server. An experiment registry groups related jobs into named variations for A/B testing. Submit the same creative across all variations in one call, then compare acceptance rates, scores, and attempt counts side by side.
+**Experiment scaffolding** — per-job config overrides let you change the provider, model, or workflow parameters (retries, variant count) without restarting the server. An experiment registry groups related jobs into named variations for A/B testing. Submit the same creative across all variations in one call, then compare acceptance rates, scores, duration, token usage, and cost side by side. Prompt version hashing tracks which prompt produced each result across runs.
 
 ---
 

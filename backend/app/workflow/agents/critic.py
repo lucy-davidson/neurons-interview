@@ -20,6 +20,7 @@ from skimage.metrics import structural_similarity as ssim
 from app import metrics
 from app.models import AuditEntry
 from app.services.llm import vision_chat
+from app.workflow.agents import timed_agent
 from app.workflow.state import RecommendationState
 
 logger = structlog.get_logger()
@@ -81,7 +82,19 @@ def _strip_code_fences(text: str) -> str:
     return cleaned.strip()
 
 
+BLIND_COMPARISON_PROMPT = (
+    "You are a visual comparison expert. You will see two marketing images.\n"
+    "The first is the ORIGINAL. The second is a MODIFIED version.\n\n"
+    "Describe ONLY the visible differences between the two images.\n"
+    "Be specific: what changed in terms of colors, layout, text, elements, backgrounds?\n"
+    "If you cannot see any meaningful difference, say 'NO VISIBLE DIFFERENCE'.\n"
+    "Do NOT guess or assume -- only describe what you can actually see."
+)
+
 SSIM_THRESHOLD = 0.95  # above this, images are considered too similar
+
+import hashlib
+SYSTEM_PROMPT_VERSION = hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest()[:12]
 
 
 def _compute_ssim(original_b64: str, edited_b64: str) -> float:
@@ -106,6 +119,7 @@ def _compute_ssim(original_b64: str, edited_b64: str) -> float:
         return 0.0  # on error, assume images are different
 
 
+@timed_agent("critic", prompt_version=SYSTEM_PROMPT_VERSION)
 async def run_critic(state: RecommendationState) -> RecommendationState:
     """Compare the edited image to the original and score compliance.
 
@@ -137,17 +151,8 @@ async def run_critic(state: RecommendationState) -> RecommendationState:
 
     # Step 1: BLIND comparison -- ask what's different WITHOUT revealing
     # what the edit was supposed to be. This prevents anchoring bias.
-    blind_prompt = (
-        "You are a visual comparison expert. You will see two marketing images.\n"
-        "The first is the ORIGINAL. The second is a MODIFIED version.\n\n"
-        "Describe ONLY the visible differences between the two images.\n"
-        "Be specific: what changed in terms of colors, layout, text, elements, backgrounds?\n"
-        "If you cannot see any meaningful difference, say 'NO VISIBLE DIFFERENCE'.\n"
-        "Do NOT guess or assume -- only describe what you can actually see."
-    )
-
     blind_result = await vision_chat(
-        system_prompt=blind_prompt,
+        system_prompt=BLIND_COMPARISON_PROMPT,
         user_text="What are the visible differences between these two images?",
         image_b64=state["original_image_b64"],
         second_image_b64=state["edited_image_b64"],
@@ -211,6 +216,18 @@ async def run_critic(state: RecommendationState) -> RecommendationState:
             logger.info("critic_no_visible_difference", attempt=attempt)
 
         metrics.variant_score.observe(score)
+
+        # Structured evaluation event
+        logger.info(
+            "critic_evaluation",
+            attempt=attempt,
+            passed=passed,
+            score=score,
+            visually_different=visually_different,
+            ssim_score=ssim_score,
+            recommendation_id=state.get("recommendation_id"),
+            prompt_version=SYSTEM_PROMPT_VERSION,
+        )
     except (json.JSONDecodeError, KeyError, ValueError):
         # Conservative default: treat unparseable responses as failures
         metrics.llm_parse_failures.labels(agent="critic").inc()
@@ -231,10 +248,21 @@ async def run_critic(state: RecommendationState) -> RecommendationState:
         )
     )
 
+    # Accumulate structured evaluation records
+    evals = list(state.get("critic_evaluations") or [])
+    evals.append({
+        "attempt": attempt,
+        "passed": passed,
+        "score": score,
+        "ssim_score": ssim_score,
+        "feedback": feedback[:300],
+    })
+
     return {
         **state,
         "evaluation_passed": passed,
         "evaluation_score": score,
         "evaluation_feedback": feedback,
         "audit_trail": trail,
+        "critic_evaluations": evals,
     }

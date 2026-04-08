@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
@@ -20,8 +22,104 @@ from aiolimiter import AsyncLimiter
 
 from app.config import settings
 from app import metrics
+from app.services.cost import estimate_token_cost, estimate_image_cost
 
 logger = structlog.get_logger()
+
+
+# ── Token usage tracking ──────────────────────────────────────────────
+
+
+@dataclass
+class TokenUsage:
+    """Token counts from a single LLM API call."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    provider: str = ""
+    model: str = ""
+    cost_usd: float = 0.0
+
+
+@dataclass
+class LLMCallRecord:
+    """Accumulates token usage across LLM calls within a scope (e.g. one agent)."""
+
+    calls: list[TokenUsage] = field(default_factory=list)
+
+    @property
+    def total_prompt_tokens(self) -> int:
+        return sum(c.prompt_tokens for c in self.calls)
+
+    @property
+    def total_completion_tokens(self) -> int:
+        return sum(c.completion_tokens for c in self.calls)
+
+    @property
+    def total_tokens(self) -> int:
+        return sum(c.total_tokens for c in self.calls)
+
+    @property
+    def total_cost_usd(self) -> float:
+        return sum(c.cost_usd for c in self.calls)
+
+    def add(self, usage: TokenUsage) -> None:
+        self.calls.append(usage)
+
+
+_llm_call_record: ContextVar[LLMCallRecord | None] = ContextVar(
+    "_llm_call_record", default=None,
+)
+
+
+def _record_token_usage(
+    provider: str, model: str, call_type: str,
+    prompt_tokens: int, completion_tokens: int,
+) -> None:
+    """Record token usage to ContextVar, Prometheus, structlog, and cost estimate."""
+    total = prompt_tokens + completion_tokens
+    cost = estimate_token_cost(provider, model, prompt_tokens, completion_tokens)
+
+    usage = TokenUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total,
+        provider=provider,
+        model=model,
+        cost_usd=cost,
+    )
+
+    # Push to ContextVar (if an agent scope is active)
+    record = _llm_call_record.get()
+    if record is not None:
+        record.add(usage)
+
+    # Prometheus
+    metrics.llm_tokens_total.labels(provider=provider, call_type=call_type, token_type="prompt").inc(prompt_tokens)
+    metrics.llm_tokens_total.labels(provider=provider, call_type=call_type, token_type="completion").inc(completion_tokens)
+    metrics.llm_estimated_cost.labels(provider=provider, call_type=call_type).inc(cost)
+
+    # Structured log
+    logger.debug(
+        "llm_token_usage",
+        provider=provider, model=model, call_type=call_type,
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+        total_tokens=total, cost_usd=round(cost, 6),
+    )
+
+
+def _record_image_cost(provider: str, model: str) -> None:
+    """Record image generation cost (no tokens, priced per image)."""
+    cost = estimate_image_cost(provider, model)
+    usage = TokenUsage(provider=provider, model=model, cost_usd=cost)
+
+    record = _llm_call_record.get()
+    if record is not None:
+        record.add(usage)
+
+    metrics.llm_estimated_cost.labels(provider=provider, call_type="edit_image").inc(cost)
+
 
 # ── Per-provider adaptive rate limiters ───────────────────────────────
 #
@@ -347,6 +445,18 @@ async def _gemini_vision_chat(
             max_output_tokens=4096,
         ),
     )
+    # Extract token usage
+    try:
+        um = resp.usage_metadata
+        if um:
+            _record_token_usage(
+                "gemini", settings.gemini_vision_model, "vision_chat",
+                getattr(um, "prompt_token_count", 0) or 0,
+                getattr(um, "candidates_token_count", 0) or 0,
+            )
+    except Exception:
+        pass
+
     try:
         return resp.text or ""
     except (AttributeError, TypeError, ValueError):
@@ -388,6 +498,15 @@ async def _openai_vision_chat(
     await _get_limiter("openai").update_from_headers(headers)
 
     parsed = resp.parse()
+
+    # Extract token usage
+    if parsed.usage:
+        _record_token_usage(
+            "openai", settings.openai_vision_model, "vision_chat",
+            parsed.usage.prompt_tokens or 0,
+            parsed.usage.completion_tokens or 0,
+        )
+
     return parsed.choices[0].message.content or ""
 
 
@@ -415,6 +534,15 @@ async def _claude_vision_chat(
         system=system_prompt,
         messages=[{"role": "user", "content": content}],
     )
+
+    # Extract token usage
+    if resp.usage:
+        _record_token_usage(
+            "claude", settings.claude_vision_model, "vision_chat",
+            getattr(resp.usage, "input_tokens", 0) or 0,
+            getattr(resp.usage, "output_tokens", 0) or 0,
+        )
+
     return resp.content[0].text
 
 
@@ -518,6 +646,7 @@ async def _gemini_edit_image(prompt: str, image_b64: str) -> str:
         if resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
             for part in resp.candidates[0].content.parts:
                 if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+                    _record_image_cost("gemini", settings.gemini_image_model)
                     return base64.b64encode(part.inline_data.data).decode()
 
         reason = (
@@ -552,6 +681,7 @@ async def _openai_edit_image(prompt: str, image_b64: str) -> str:
         kwargs["response_format"] = "b64_json"
 
     resp = await client.images.edit(**kwargs)
+    _record_image_cost("openai", settings.openai_image_model)
 
     if resp.data[0].b64_json:
         return resp.data[0].b64_json
