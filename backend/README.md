@@ -81,6 +81,12 @@ Three LLM providers supported with automatic fallback: **Gemini**, **OpenAI**, *
 | `GET` | `/api/v1/experiments/{id}` | Experiment detail with variations. |
 | `POST` | `/api/v1/experiments/{id}/run` | Run all variations with same input. Returns `202`. |
 | `GET` | `/api/v1/experiments/{id}/results` | Per-variation comparison (acceptance rate, scores). |
+| `GET` | `/api/v1/feedback/calibration` | Critic score vs user feedback correlation. |
+| `POST` | `/api/v1/rollout/configs` | Create/update a weighted rollout config. |
+| `GET` | `/api/v1/rollout/configs` | List all rollout configs and weights. |
+| `PUT` | `/api/v1/rollout/configs/{name}` | Adjust weight or active status. |
+| `DELETE` | `/api/v1/rollout/configs/{name}` | Remove a rollout config. |
+| `GET` | `/api/v1/rollout/performance` | Per-config feedback performance stats. |
 | `GET` | `/api/v1/metrics/summary` | System metrics summary (JSON). |
 | `GET` | `/metrics` | Prometheus scrape endpoint. |
 | `GET` | `/health` | Liveness probe with DB status. |
@@ -153,9 +159,9 @@ pip install -r requirements.txt pytest
 python -m pytest tests/ -v
 ```
 
-106 tests across 3 files:
+123 tests across 3 files:
 - `test_agents.py` (27) -- agent logic, SSIM, blind comparison, routing
-- `test_api.py` (63) -- validation, lifecycle, cancel, feedback, thumbnails, DB, metrics, config overrides, experiments, error messages
+- `test_api.py` (80) -- validation, lifecycle, cancel, feedback, thumbnails, DB, metrics, config overrides, experiments, calibration, rollout, error messages
 - `test_rate_limiter.py` (16) -- error detection, adaptive backoff, per-provider isolation
 
 All tests mock LLM calls -- no API keys needed.

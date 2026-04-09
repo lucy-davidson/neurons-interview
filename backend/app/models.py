@@ -142,6 +142,7 @@ class Job(BaseModel):
     config_snapshot: dict | None = None
     experiment_id: str | None = None
     variation_name: str | None = None
+    rollout_config_name: str | None = None
 
     def to_response(self) -> JobResponse:
         """Project this internal record into the public API shape."""

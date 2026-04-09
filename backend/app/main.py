@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import pathlib
+import random
 import uuid
 from contextlib import asynccontextmanager
 
@@ -319,6 +320,25 @@ async def _validate_image(image: UploadFile) -> tuple[bytes, list[str]]:
     return image_data, warnings
 
 
+# ── Rollout traffic routing ─────────────────────────────────────────
+
+
+def _pick_rollout_config(configs: list[dict]) -> dict | None:
+    """Select a rollout config using weighted random selection."""
+    if not configs:
+        return None
+    total = sum(c["weight"] for c in configs)
+    if total <= 0:
+        return None
+    r = random.random() * total
+    cumulative = 0.0
+    for c in configs:
+        cumulative += c["weight"]
+        if r <= cumulative:
+            return c
+    return configs[-1]
+
+
 # ── Helper: persist results after each variant ─────────────────────
 
 
@@ -498,6 +518,20 @@ async def create_job(
         errors = overrides.validate_values()
         if errors:
             raise HTTPException(status_code=400, detail="; ".join(errors))
+    # Rollout routing: if no explicit overrides, pick from active rollout configs
+    rollout_config_name = None
+    if overrides is None and db.is_enabled():
+        active_configs = await db.get_active_rollout_configs()
+        if active_configs:
+            selected = _pick_rollout_config(active_configs)
+            if selected:
+                rollout_config_name = selected["name"]
+                overrides = ConfigOverrides(**{
+                    k: v for k, v in selected["config"].items()
+                    if k in ConfigOverrides.model_fields
+                })
+                logger.info("rollout_config_selected", config_name=rollout_config_name)
+
     rc = RuntimeConfig(overrides)
     config_snapshot = rc.snapshot()
 
@@ -506,6 +540,7 @@ async def create_job(
         recommendations=request.recommendations,
         brand_guidelines=request.brand_guidelines,
         config_snapshot=config_snapshot,
+        rollout_config_name=rollout_config_name,
     )
 
     # Persist to both in-memory store and database
@@ -519,6 +554,7 @@ async def create_job(
             recommendations=[r.model_dump() for r in request.recommendations],
             brand_guidelines=request.brand_guidelines.model_dump(),
             config_snapshot=config_snapshot,
+            rollout_config_name=rollout_config_name,
         )
 
     # Fire-and-forget: the polling endpoint exposes progress
@@ -751,6 +787,28 @@ async def feedback_stats() -> dict:
     if db.is_enabled():
         return await db.get_feedback_stats()
     return {}
+
+
+@app.get("/api/v1/feedback/calibration")
+async def feedback_calibration() -> dict:
+    """Analyse how well the critic's scores correlate with user feedback.
+
+    Returns score distributions by sentiment, per-provider satisfaction
+    rates, threshold analysis, and per-recommendation-type breakdown.
+    """
+    if not db.is_enabled():
+        raise HTTPException(status_code=503, detail="Database not configured. Calibration requires stored feedback data.")
+    result = await db.get_feedback_calibration()
+    if not result:
+        return {
+            "score_distribution": {},
+            "provider_satisfaction": [],
+            "threshold_analysis": [],
+            "by_recommendation_type": [],
+            "total_feedback_with_scores": 0,
+            "message": "No feedback data with evaluation scores found.",
+        }
+    return result
 
 
 @app.get("/api/v1/experiments/comparison")
@@ -1177,6 +1235,89 @@ async def get_experiment_results(experiment_id: str) -> dict:
         "status": "completed" if (all_done and jobs) else "running" if jobs else "pending",
         "variations": variations,
     }
+
+
+# ── Rollout config endpoints ────────────────────────────────────────
+
+
+@app.post("/api/v1/rollout/configs", status_code=201)
+async def create_rollout_config_endpoint(body: dict) -> dict:
+    """Create or update a rollout config with a traffic weight.
+
+    Body: {"name": "...", "config": {...}, "weight": 0.9, "active": true}
+    """
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Config name is required.")
+    weight = body.get("weight", 1.0)
+    if not isinstance(weight, (int, float)) or weight < 0 or weight > 1.0:
+        raise HTTPException(status_code=400, detail="Weight must be between 0.0 and 1.0.")
+    config = body.get("config", {})
+    if config:
+        try:
+            ov = ConfigOverrides(**{k: v for k, v in config.items() if k in ConfigOverrides.model_fields})
+            errors = ov.validate_values()
+            if errors:
+                raise HTTPException(status_code=400, detail="; ".join(errors))
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    active = body.get("active", True)
+    if not db.is_enabled():
+        raise HTTPException(status_code=503, detail="Database required for rollout configs.")
+    await db.create_rollout_config(name=name, config_json=config, weight=weight, active=active)
+    logger.info("rollout_config_created", name=name, weight=weight)
+    return {"name": name, "weight": weight, "active": active, "config": config}
+
+
+@app.get("/api/v1/rollout/configs")
+async def list_rollout_configs_endpoint() -> dict:
+    """List all rollout configs and their weights."""
+    if not db.is_enabled():
+        return {"configs": [], "total_weight": 0}
+    configs = await db.list_rollout_configs()
+    total_weight = sum(c["weight"] for c in configs if c.get("active"))
+    return {"configs": configs, "total_weight": round(total_weight, 3)}
+
+
+@app.put("/api/v1/rollout/configs/{name}")
+async def update_rollout_config_endpoint(name: str, body: dict) -> dict:
+    """Update a rollout config's weight and/or active status."""
+    if not db.is_enabled():
+        raise HTTPException(status_code=503, detail="Database required for rollout configs.")
+    weight = body.get("weight")
+    active = body.get("active")
+    if weight is not None and (not isinstance(weight, (int, float)) or weight < 0 or weight > 1.0):
+        raise HTTPException(status_code=400, detail="Weight must be between 0.0 and 1.0.")
+    if weight is None and active is None:
+        raise HTTPException(status_code=400, detail="Provide 'weight' or 'active' to update.")
+    found = await db.update_rollout_config(name, weight=weight, active=active)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Rollout config '{name}' not found.")
+    logger.info("rollout_config_updated", name=name, weight=weight, active=active)
+    return {"name": name, "updated": True}
+
+
+@app.delete("/api/v1/rollout/configs/{name}")
+async def delete_rollout_config_endpoint(name: str) -> dict:
+    """Remove a rollout config."""
+    if not db.is_enabled():
+        raise HTTPException(status_code=503, detail="Database required for rollout configs.")
+    found = await db.delete_rollout_config(name)
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Rollout config '{name}' not found.")
+    logger.info("rollout_config_deleted", name=name)
+    return {"name": name, "deleted": True}
+
+
+@app.get("/api/v1/rollout/performance")
+async def rollout_performance() -> dict:
+    """Per-rollout-config feedback and performance stats."""
+    if not db.is_enabled():
+        raise HTTPException(status_code=503, detail="Database required for rollout performance.")
+    stats = await db.get_rollout_performance()
+    return {"configs": stats}
 
 
 # ── Static frontend ────────────────────────────────────────────────

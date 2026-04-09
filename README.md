@@ -53,9 +53,9 @@ Variants are tried in batches of 2 from the pool of approved ideas. If a batch f
 
 ### Unit tests (optional — implemented)
 
-106 tests across 3 files, all run in ~7 seconds with no API keys:
+123 tests across 3 files, all run in ~7 seconds with no API keys:
 - 27 agent tests — parsing, fallbacks, SSIM, blind comparison, routing edge cases
-- 63 API tests — validation, job lifecycle, cancel, feedback, thumbnails, DB persistence, config overrides, experiments, error messages
+- 80 API tests — validation, job lifecycle, cancel, feedback, thumbnails, DB persistence, config overrides, experiments, calibration, rollout routing, error messages
 - 16 rate limiter tests — error detection, adaptive backoff, per-provider isolation
 
 ### Frontend (optional — implemented)

@@ -38,11 +38,23 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
+_ROLLOUT_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS rollout_configs (
+    name            TEXT PRIMARY KEY,
+    config_json     JSONB NOT NULL DEFAULT '{}',
+    weight          FLOAT NOT NULL DEFAULT 1.0,
+    active          BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+
 _MIGRATION_SQL = """
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_heartbeat TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS config_snapshot JSONB;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS experiment_id TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS variation_name TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS rollout_config_name TEXT;
 ALTER TABLE feedback ADD COLUMN IF NOT EXISTS text_model TEXT;
 ALTER TABLE feedback ADD COLUMN IF NOT EXISTS image_model TEXT;
 """
@@ -100,6 +112,7 @@ async def init_db() -> None:
             await conn.execute(_SCHEMA_SQL)
             await conn.execute(_FEEDBACK_SCHEMA_SQL)
             await conn.execute(_EXPERIMENTS_SCHEMA_SQL)
+            await conn.execute(_ROLLOUT_SCHEMA_SQL)
             await conn.execute(_MIGRATION_SQL)
         logger.info("db_initialised")
     except Exception as exc:
@@ -197,6 +210,7 @@ async def create_job(
     config_snapshot: dict[str, Any] | None = None,
     experiment_id: str | None = None,
     variation_name: str | None = None,
+    rollout_config_name: str | None = None,
 ) -> None:
     """Insert a new job row."""
     if not _pool:
@@ -206,9 +220,10 @@ async def create_job(
             """
             INSERT INTO jobs (job_id, status, created_at, original_image_b64,
                               recommendations, brand_guidelines, results,
-                              config_snapshot, experiment_id, variation_name)
+                              config_snapshot, experiment_id, variation_name,
+                              rollout_config_name)
             VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, '[]'::jsonb,
-                    $7::jsonb, $8, $9)
+                    $7::jsonb, $8, $9, $10)
             """,
             job_id,
             status,
@@ -219,6 +234,7 @@ async def create_job(
             json.dumps(config_snapshot) if config_snapshot else None,
             experiment_id,
             variation_name,
+            rollout_config_name,
         )
     except Exception as exc:
         logger.error("db_create_job_failed", job_id=job_id, error=str(exc))
@@ -386,6 +402,284 @@ async def get_feedback_stats() -> dict[str, Any]:
     except Exception as exc:
         logger.error("db_get_feedback_stats_failed", error=str(exc))
         return {}
+
+
+# ── Critic calibration ─────────────────────────────────────────────
+
+
+async def get_feedback_calibration() -> dict[str, Any]:
+    """Analyse correlation between critic scores and user feedback.
+
+    Returns score distributions by sentiment, per-provider satisfaction,
+    threshold analysis, and per-recommendation-type breakdown.
+    """
+    if not _pool:
+        return {}
+    try:
+        async with _pool.acquire() as conn:
+            # Score distribution by sentiment
+            score_rows = await conn.fetch("""
+                SELECT
+                    CASE WHEN feedback_type IN ('thumbs_up', 'selected') THEN 'positive'
+                         WHEN feedback_type = 'thumbs_down' THEN 'negative'
+                         ELSE 'other' END AS sentiment,
+                    COUNT(*) AS count,
+                    AVG(evaluation_score) AS avg_score,
+                    MIN(evaluation_score) AS min_score,
+                    MAX(evaluation_score) AS max_score,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY evaluation_score) AS median_score
+                FROM feedback
+                WHERE evaluation_score IS NOT NULL
+                  AND feedback_type IN ('thumbs_up', 'thumbs_down', 'selected')
+                GROUP BY sentiment
+            """)
+            score_dist = {}
+            for r in score_rows:
+                score_dist[r["sentiment"]] = {
+                    "count": r["count"],
+                    "avg_score": round(float(r["avg_score"]), 3) if r["avg_score"] else 0,
+                    "median_score": round(float(r["median_score"]), 3) if r["median_score"] else 0,
+                    "min_score": round(float(r["min_score"]), 3) if r["min_score"] else 0,
+                    "max_score": round(float(r["max_score"]), 3) if r["max_score"] else 0,
+                }
+
+            # Per-provider satisfaction
+            provider_rows = await conn.fetch("""
+                SELECT
+                    text_provider, image_provider,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE feedback_type IN ('thumbs_up', 'selected')) AS positive,
+                    COUNT(*) FILTER (WHERE feedback_type = 'thumbs_down') AS negative
+                FROM feedback
+                WHERE feedback_type IN ('thumbs_up', 'thumbs_down', 'selected')
+                GROUP BY text_provider, image_provider
+            """)
+            provider_satisfaction = [
+                {
+                    "text_provider": r["text_provider"],
+                    "image_provider": r["image_provider"],
+                    "total": r["total"],
+                    "positive": r["positive"],
+                    "negative": r["negative"],
+                    "positive_rate": round(r["positive"] / r["total"], 3) if r["total"] else 0,
+                }
+                for r in provider_rows
+            ]
+
+            # Threshold analysis
+            thresholds = [0.3, 0.5, 0.6, 0.7, 0.8, 0.9]
+            threshold_analysis = []
+            for t in thresholds:
+                row = await conn.fetchrow("""
+                    SELECT
+                        COUNT(*) AS total_above,
+                        COUNT(*) FILTER (WHERE feedback_type IN ('thumbs_up', 'selected')) AS positive_above
+                    FROM feedback
+                    WHERE evaluation_score IS NOT NULL
+                      AND evaluation_score >= $1
+                      AND feedback_type IN ('thumbs_up', 'thumbs_down', 'selected')
+                """, t)
+                threshold_analysis.append({
+                    "threshold": t,
+                    "total_above": row["total_above"],
+                    "positive_above": row["positive_above"],
+                    "positive_rate": round(row["positive_above"] / row["total_above"], 3) if row["total_above"] else 0,
+                })
+
+            # Per-recommendation-type breakdown
+            rec_rows = await conn.fetch("""
+                SELECT
+                    recommendation_type,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE feedback_type IN ('thumbs_up', 'selected')) AS positive,
+                    COUNT(*) FILTER (WHERE feedback_type = 'thumbs_down') AS negative,
+                    AVG(evaluation_score) AS avg_score
+                FROM feedback
+                WHERE feedback_type IN ('thumbs_up', 'thumbs_down', 'selected')
+                  AND recommendation_type IS NOT NULL
+                GROUP BY recommendation_type
+            """)
+            by_rec_type = [
+                {
+                    "type": r["recommendation_type"],
+                    "total": r["total"],
+                    "positive": r["positive"],
+                    "negative": r["negative"],
+                    "positive_rate": round(r["positive"] / r["total"], 3) if r["total"] else 0,
+                    "avg_score": round(float(r["avg_score"]), 3) if r["avg_score"] else 0,
+                }
+                for r in rec_rows
+            ]
+
+            # Total count
+            total_row = await conn.fetchrow("""
+                SELECT COUNT(*) AS cnt FROM feedback
+                WHERE evaluation_score IS NOT NULL
+                  AND feedback_type IN ('thumbs_up', 'thumbs_down', 'selected')
+            """)
+
+            return {
+                "score_distribution": score_dist,
+                "provider_satisfaction": provider_satisfaction,
+                "threshold_analysis": threshold_analysis,
+                "by_recommendation_type": by_rec_type,
+                "total_feedback_with_scores": total_row["cnt"],
+            }
+    except Exception as exc:
+        logger.error("db_get_calibration_failed", error=str(exc))
+        return {}
+
+
+# ── Rollout config operations ─────────────────────────────────────
+
+
+async def create_rollout_config(
+    name: str, config_json: dict[str, Any], weight: float, active: bool = True,
+) -> None:
+    """Insert or update a rollout config (upsert)."""
+    if not _pool:
+        return
+    try:
+        await _pool.execute(
+            """
+            INSERT INTO rollout_configs (name, config_json, weight, active, updated_at)
+            VALUES ($1, $2::jsonb, $3, $4, NOW())
+            ON CONFLICT (name) DO UPDATE SET
+                config_json = EXCLUDED.config_json,
+                weight = EXCLUDED.weight,
+                active = EXCLUDED.active,
+                updated_at = NOW()
+            """,
+            name, json.dumps(config_json), weight, active,
+        )
+    except Exception as exc:
+        logger.error("db_create_rollout_config_failed", name=name, error=str(exc))
+
+
+async def list_rollout_configs() -> list[dict[str, Any]]:
+    """Return all rollout configs."""
+    if not _pool:
+        return []
+    try:
+        rows = await _pool.fetch(
+            "SELECT name, config_json, weight, active, created_at, updated_at "
+            "FROM rollout_configs ORDER BY name"
+        )
+        return [
+            {
+                "name": r["name"],
+                "config": json.loads(r["config_json"]) if isinstance(r["config_json"], str) else r["config_json"],
+                "weight": float(r["weight"]),
+                "active": r["active"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            }
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.error("db_list_rollout_configs_failed", error=str(exc))
+        return []
+
+
+async def get_active_rollout_configs() -> list[dict[str, Any]]:
+    """Return only active rollout configs (for traffic routing)."""
+    if not _pool:
+        return []
+    try:
+        rows = await _pool.fetch(
+            "SELECT name, config_json, weight FROM rollout_configs "
+            "WHERE active = true ORDER BY name"
+        )
+        return [
+            {
+                "name": r["name"],
+                "config": json.loads(r["config_json"]) if isinstance(r["config_json"], str) else r["config_json"],
+                "weight": float(r["weight"]),
+            }
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.error("db_get_active_rollout_configs_failed", error=str(exc))
+        return []
+
+
+async def update_rollout_config(
+    name: str, weight: float | None = None, active: bool | None = None,
+) -> bool:
+    """Update a rollout config's weight and/or active flag. Returns True if found."""
+    if not _pool:
+        return False
+    try:
+        sets = ["updated_at = NOW()"]
+        params: list[Any] = []
+        idx = 1
+        if weight is not None:
+            sets.append(f"weight = ${idx}")
+            params.append(weight)
+            idx += 1
+        if active is not None:
+            sets.append(f"active = ${idx}")
+            params.append(active)
+            idx += 1
+        params.append(name)
+        result = await _pool.execute(
+            f"UPDATE rollout_configs SET {', '.join(sets)} WHERE name = ${idx}",
+            *params,
+        )
+        return result.endswith("1")
+    except Exception as exc:
+        logger.error("db_update_rollout_config_failed", name=name, error=str(exc))
+        return False
+
+
+async def delete_rollout_config(name: str) -> bool:
+    """Delete a rollout config. Returns True if found."""
+    if not _pool:
+        return False
+    try:
+        result = await _pool.execute(
+            "DELETE FROM rollout_configs WHERE name = $1", name,
+        )
+        return result.endswith("1")
+    except Exception as exc:
+        logger.error("db_delete_rollout_config_failed", name=name, error=str(exc))
+        return False
+
+
+async def get_rollout_performance() -> list[dict[str, Any]]:
+    """Return per-rollout-config feedback and performance stats."""
+    if not _pool:
+        return []
+    try:
+        rows = await _pool.fetch("""
+            SELECT
+                j.rollout_config_name,
+                COUNT(DISTINCT j.job_id) AS job_count,
+                COUNT(f.id) AS feedback_count,
+                COUNT(f.id) FILTER (WHERE f.feedback_type IN ('thumbs_up', 'selected')) AS positive,
+                COUNT(f.id) FILTER (WHERE f.feedback_type = 'thumbs_down') AS negative,
+                AVG(f.evaluation_score) AS avg_score
+            FROM jobs j
+            LEFT JOIN feedback f ON j.job_id = f.job_id
+            WHERE j.rollout_config_name IS NOT NULL
+            GROUP BY j.rollout_config_name
+            ORDER BY j.rollout_config_name
+        """)
+        return [
+            {
+                "config_name": r["rollout_config_name"],
+                "job_count": r["job_count"],
+                "feedback_count": r["feedback_count"],
+                "positive": r["positive"],
+                "negative": r["negative"],
+                "positive_rate": round(r["positive"] / r["feedback_count"], 3) if r["feedback_count"] else 0,
+                "avg_score": round(float(r["avg_score"]), 3) if r["avg_score"] else None,
+            }
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.error("db_get_rollout_performance_failed", error=str(exc))
+        return []
 
 
 # ── Experiment operations ──────────────────────────────────────────

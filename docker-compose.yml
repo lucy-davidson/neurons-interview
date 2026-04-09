@@ -71,6 +71,24 @@ services:
       backend:
         condition: service_healthy
 
+  loki:
+    image: grafana/loki:3.4.2
+    volumes:
+      - ./backend/monitoring/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:3.4.2
+    volumes:
+      - ./backend/monitoring/loki/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+
   grafana:
     image: grafana/grafana:11.6.0
     environment:
@@ -78,7 +96,7 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=visrec
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_AUTH_DISABLE_LOGIN_FORM=true
     volumes:
       - ./backend/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -88,6 +106,7 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+      - loki
 
 volumes:
   pgdata:
@@ -95,3 +114,4 @@ volumes:
   grafana_data:
   pgadmin_data:
   backend_logs:
+  loki_data:

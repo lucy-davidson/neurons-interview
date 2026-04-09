@@ -451,6 +451,7 @@ def test_job_persisted_to_db_on_create(mock_run, mock_db):
     mock_db.update_job_status = AsyncMock()
     mock_db.update_job_results = AsyncMock()
     mock_db.touch_heartbeat = AsyncMock()
+    mock_db.get_active_rollout_configs = AsyncMock(return_value=[])
 
     data = _submit_job()
 
@@ -469,6 +470,7 @@ def test_job_status_updated_in_db(mock_run, mock_db):
     mock_db.update_job_status = AsyncMock()
     mock_db.update_job_results = AsyncMock()
     mock_db.touch_heartbeat = AsyncMock()
+    mock_db.get_active_rollout_configs = AsyncMock(return_value=[])
 
     async def fake_run(**kwargs):
         job_results = kwargs.get("job_results", [])
@@ -1242,3 +1244,228 @@ def test_invalid_image_provider_in_config():
     )
     assert resp.status_code == 400
     assert "claude" in resp.json()["detail"]
+
+
+# ── Critic calibration endpoint ──────────────────────────────────────
+
+
+@patch("app.main.db")
+def test_calibration_without_db(mock_db):
+    """Calibration should return 503 when DB is disabled."""
+    mock_db.is_enabled.return_value = False
+    resp = client.get("/api/v1/feedback/calibration")
+    assert resp.status_code == 503
+
+
+@patch("app.main.db")
+def test_calibration_with_data(mock_db):
+    """Calibration should return all expected sections."""
+    mock_db.is_enabled.return_value = True
+    mock_db.get_feedback_calibration = AsyncMock(return_value={
+        "score_distribution": {
+            "positive": {"count": 10, "avg_score": 0.82, "median_score": 0.85, "min_score": 0.6, "max_score": 0.95},
+            "negative": {"count": 5, "avg_score": 0.45, "median_score": 0.4, "min_score": 0.1, "max_score": 0.7},
+        },
+        "provider_satisfaction": [
+            {"text_provider": "gemini", "image_provider": "gemini", "total": 15, "positive": 10, "negative": 5, "positive_rate": 0.667},
+        ],
+        "threshold_analysis": [
+            {"threshold": 0.7, "total_above": 8, "positive_above": 7, "positive_rate": 0.875},
+        ],
+        "by_recommendation_type": [
+            {"type": "contrast_salience", "total": 10, "positive": 8, "negative": 2, "positive_rate": 0.8, "avg_score": 0.75},
+        ],
+        "total_feedback_with_scores": 15,
+    })
+    resp = client.get("/api/v1/feedback/calibration")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "score_distribution" in data
+    assert "provider_satisfaction" in data
+    assert "threshold_analysis" in data
+    assert "by_recommendation_type" in data
+    assert data["total_feedback_with_scores"] == 15
+
+
+@patch("app.main.db")
+def test_calibration_empty_data(mock_db):
+    """Calibration with no feedback data should return empty structure with message."""
+    mock_db.is_enabled.return_value = True
+    mock_db.get_feedback_calibration = AsyncMock(return_value={})
+    resp = client.get("/api/v1/feedback/calibration")
+    assert resp.status_code == 200
+    assert "message" in resp.json()
+
+
+# ── Rollout config endpoints ─────────────────────────────────────────
+
+
+@patch("app.main.db")
+def test_create_rollout_config(mock_db):
+    """Creating a rollout config should return 201."""
+    mock_db.is_enabled.return_value = True
+    mock_db.create_rollout_config = AsyncMock()
+    resp = client.post("/api/v1/rollout/configs", json={
+        "name": "gemini-primary", "config": {"text_provider": "gemini"}, "weight": 0.9,
+    })
+    assert resp.status_code == 201
+    assert resp.json()["name"] == "gemini-primary"
+    assert resp.json()["weight"] == 0.9
+
+
+def test_create_rollout_config_no_name():
+    """Missing name should return 400."""
+    resp = client.post("/api/v1/rollout/configs", json={"config": {}, "weight": 0.5})
+    assert resp.status_code == 400
+
+
+def test_create_rollout_config_invalid_weight():
+    """Weight > 1.0 should return 400."""
+    resp = client.post("/api/v1/rollout/configs", json={"name": "test", "weight": 1.5})
+    assert resp.status_code == 400
+
+
+def test_create_rollout_config_invalid_provider():
+    """Invalid provider in config should return 400."""
+    resp = client.post("/api/v1/rollout/configs", json={
+        "name": "test", "config": {"text_provider": "banana"}, "weight": 0.5,
+    })
+    assert resp.status_code == 400
+    assert "banana" in resp.json()["detail"]
+
+
+@patch("app.main.db")
+def test_list_rollout_configs(mock_db):
+    """Listing rollout configs should return configs and total weight."""
+    mock_db.is_enabled.return_value = True
+    mock_db.list_rollout_configs = AsyncMock(return_value=[
+        {"name": "gemini", "config": {}, "weight": 0.9, "active": True, "created_at": None, "updated_at": None},
+        {"name": "openai", "config": {}, "weight": 0.1, "active": True, "created_at": None, "updated_at": None},
+    ])
+    resp = client.get("/api/v1/rollout/configs")
+    assert resp.status_code == 200
+    assert len(resp.json()["configs"]) == 2
+    assert resp.json()["total_weight"] == 1.0
+
+
+@patch("app.main.db")
+def test_update_rollout_config(mock_db):
+    """Updating weight should return success."""
+    mock_db.is_enabled.return_value = True
+    mock_db.update_rollout_config = AsyncMock(return_value=True)
+    resp = client.put("/api/v1/rollout/configs/gemini", json={"weight": 0.5})
+    assert resp.status_code == 200
+    assert resp.json()["updated"] is True
+
+
+@patch("app.main.db")
+def test_update_rollout_config_not_found(mock_db):
+    """Updating nonexistent config should return 404."""
+    mock_db.is_enabled.return_value = True
+    mock_db.update_rollout_config = AsyncMock(return_value=False)
+    resp = client.put("/api/v1/rollout/configs/nonexistent", json={"weight": 0.5})
+    assert resp.status_code == 404
+
+
+@patch("app.main.db")
+def test_delete_rollout_config(mock_db):
+    """Deleting a config should return success."""
+    mock_db.is_enabled.return_value = True
+    mock_db.delete_rollout_config = AsyncMock(return_value=True)
+    resp = client.delete("/api/v1/rollout/configs/gemini")
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+
+
+@patch("app.main.db")
+def test_delete_rollout_config_not_found(mock_db):
+    """Deleting nonexistent config should return 404."""
+    mock_db.is_enabled.return_value = True
+    mock_db.delete_rollout_config = AsyncMock(return_value=False)
+    resp = client.delete("/api/v1/rollout/configs/nonexistent")
+    assert resp.status_code == 404
+
+
+@patch("app.main.db")
+def test_rollout_performance(mock_db):
+    """Performance endpoint should return per-config stats."""
+    mock_db.is_enabled.return_value = True
+    mock_db.get_rollout_performance = AsyncMock(return_value=[
+        {"config_name": "gemini", "job_count": 5, "feedback_count": 10,
+         "positive": 8, "negative": 2, "positive_rate": 0.8, "avg_score": 0.82},
+    ])
+    resp = client.get("/api/v1/rollout/performance")
+    assert resp.status_code == 200
+    assert len(resp.json()["configs"]) == 1
+    assert resp.json()["configs"][0]["positive_rate"] == 0.8
+
+
+def test_pick_rollout_config_weighted():
+    """Weighted selection should approximately match the weights."""
+    from app.main import _pick_rollout_config
+    configs = [
+        {"name": "heavy", "weight": 0.9, "config": {}},
+        {"name": "light", "weight": 0.1, "config": {}},
+    ]
+    counts = {"heavy": 0, "light": 0}
+    for _ in range(1000):
+        picked = _pick_rollout_config(configs)
+        counts[picked["name"]] += 1
+    # heavy should be picked ~900 times, allow wide tolerance
+    assert counts["heavy"] > 700
+    assert counts["light"] > 30
+
+
+def test_pick_rollout_config_empty():
+    """Empty config list should return None."""
+    from app.main import _pick_rollout_config
+    assert _pick_rollout_config([]) is None
+
+
+@patch("app.main.db")
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_job_uses_rollout_when_no_overrides(mock_run, mock_db):
+    """Job without config_overrides should use rollout config if available."""
+    mock_run.return_value = []
+    mock_db.is_enabled.return_value = True
+    mock_db.create_job = AsyncMock()
+    mock_db.update_job_status = AsyncMock()
+    mock_db.update_job_results = AsyncMock()
+    mock_db.touch_heartbeat = AsyncMock()
+    mock_db.get_active_rollout_configs = AsyncMock(return_value=[
+        {"name": "gemini-canary", "config": {"text_provider": "gemini"}, "weight": 1.0},
+    ])
+
+    data = _submit_job()
+    job = _jobs[data["job_id"]]
+    assert job.rollout_config_name == "gemini-canary"
+    assert job.config_snapshot["text_provider"] == "gemini"
+
+
+@patch("app.main.db")
+@patch("app.main.run_all_recommendations", new_callable=AsyncMock)
+def test_explicit_overrides_skip_rollout(mock_run, mock_db):
+    """Explicit config_overrides should take precedence over rollout configs."""
+    mock_run.return_value = []
+    mock_db.is_enabled.return_value = True
+    mock_db.create_job = AsyncMock()
+    mock_db.update_job_status = AsyncMock()
+    mock_db.update_job_results = AsyncMock()
+    mock_db.touch_heartbeat = AsyncMock()
+    mock_db.get_active_rollout_configs = AsyncMock(return_value=[
+        {"name": "gemini-canary", "config": {"text_provider": "gemini"}, "weight": 1.0},
+    ])
+
+    body = json.dumps({
+        "recommendations": [{"id": "r1", "title": "T", "description": "D", "type": "t"}],
+        "brand_guidelines": {"protected_regions": [], "typography": "", "aspect_ratio": "", "brand_elements": ""},
+        "config_overrides": {"text_provider": "claude"},
+    })
+    resp = client.post(
+        "/api/v1/jobs",
+        files={"image": ("t.png", _make_test_image(), "image/png"), "request_body": ("b.json", body, "application/json")},
+    )
+    assert resp.status_code == 202
+    job = _jobs[resp.json()["job_id"]]
+    assert job.rollout_config_name is None
+    assert job.config_snapshot["text_provider"] == "claude"
