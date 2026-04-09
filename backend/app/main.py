@@ -394,6 +394,13 @@ async def _process_job(job: Job) -> None:
         else:
             rc = RuntimeConfig()
 
+        # If rollout configs are active, pass them so each variant can
+        # independently pick a config. This means a single job shows
+        # variants from different models side by side.
+        active_rollout = None
+        if job.rollout_config_name and db.is_enabled():
+            active_rollout = await db.get_active_rollout_configs()
+
         await run_all_recommendations(
             image_b64=job.original_image_b64,
             recommendations=job.recommendations,
@@ -402,6 +409,7 @@ async def _process_job(job: Job) -> None:
             job_results=job.results,
             on_variant_complete=lambda: _persist_results(job.job_id, job.results),
             runtime_config=rc,
+            rollout_configs=active_rollout,
         )
         job.status = JobStatus.COMPLETED
         metrics.jobs_completed.labels(status="completed").inc()

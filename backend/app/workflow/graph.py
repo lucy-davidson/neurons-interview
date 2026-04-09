@@ -41,6 +41,24 @@ logger = structlog.get_logger()
 
 MAX_IDEA_REVISIONS = 2  # Max rounds of idea critique before proceeding
 
+
+def _pick_rollout_config_for_variant(configs: list[dict]) -> dict | None:
+    """Weighted random selection of a rollout config for a single variant."""
+    import random
+    if not configs:
+        return None
+    total = sum(c["weight"] for c in configs)
+    if total <= 0:
+        return None
+    r = random.random() * total
+    cumulative = 0.0
+    for c in configs:
+        cumulative += c["weight"]
+        if r <= cumulative:
+            return c
+    return configs[-1]
+
+
 # ── Routing logic ───────────────────────────────────────────────────
 
 
@@ -201,6 +219,7 @@ async def run_recommendation_workflow(
     rec_result: RecommendationResult | None = None,
     on_variant_complete: Any | None = None,
     runtime_config: Any | None = None,
+    rollout_configs: list[dict] | None = None,
 ) -> RecommendationResult:
     """Ideate, critique ideas, then run each approved variant through the graph.
 
@@ -259,6 +278,22 @@ async def run_recommendation_workflow(
 
     async def _process_variant(idx: int, v: dict) -> VariantResult | None:
         try:
+            # Per-variant config: if rollout configs exist, each variant
+            # independently picks a config. This means a single job can
+            # show variants from different models side by side, so users
+            # always see a mix during A/B testing.
+            variant_rc = runtime_config
+            if rollout_configs:
+                from app.config import ConfigOverrides, RuntimeConfig as _RC
+                selected = _pick_rollout_config_for_variant(rollout_configs)
+                if selected:
+                    variant_rc = _RC(ConfigOverrides(**{
+                        k: val for k, val in selected["config"].items()
+                        if k in ConfigOverrides.model_fields
+                    }))
+                    logger.info("variant_config_assigned",
+                                variant_idx=idx, config_name=selected["name"])
+
             vr = await _run_variant(
                 image_b64=image_b64,
                 recommendation=recommendation,
@@ -266,7 +301,7 @@ async def run_recommendation_workflow(
                 variant_id=f"{recommendation.id}_v{idx + 1}",
                 brand_guidelines_text=guidelines_text,
                 max_attempts=max_attempts,
-                runtime_config=runtime_config,
+                runtime_config=variant_rc,
             )
             rec_result.variants.append(vr)
             metrics.variants_processed.labels(status=vr.status).inc()
@@ -332,6 +367,7 @@ async def run_all_recommendations(
     job_results: list[RecommendationResult] | None = None,
     on_variant_complete: Any | None = None,
     runtime_config: Any | None = None,
+    rollout_configs: list[dict] | None = None,
 ) -> list[RecommendationResult]:
     """Process every recommendation concurrently.
 
@@ -357,6 +393,7 @@ async def run_all_recommendations(
             image_b64, rec, brand_guidelines, max_attempts,
             rec_result=rr, on_variant_complete=on_variant_complete,
             runtime_config=runtime_config,
+            rollout_configs=rollout_configs,
         )
         for rec, rr in zip(recommendations, rec_results)
     ]
