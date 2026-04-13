@@ -20,14 +20,16 @@ ln -sf backend/.env .env
 docker-compose up --build
 ```
 
-Five services come up:
+Seven services come up:
 
 | Service | URL | Purpose |
 |---------|-----|---------|
 | **Backend + Frontend** | http://localhost:8000 | REST API + static HTML frontend |
-| **Grafana** | http://localhost:3000 | Metrics dashboards (no login required) |
+| **Grafana** | http://localhost:3000 | Metrics + log dashboards |
 | **pgAdmin** | http://localhost:5050 | Database browser |
 | **Prometheus** | http://localhost:9090 | Metrics collection |
+| **Loki** | http://localhost:3100 | Log aggregation |
+| **Promtail** | internal only | Ships container logs to Loki |
 | **PostgreSQL** | internal only | Job persistence |
 
 The frontend has a **"Load Sample Data"** dropdown for quick demos -- select a sample creative, and the image, recommendations, and brand guidelines are pre-filled.
@@ -195,13 +197,15 @@ backend/
 │   ├── index.html           # Vanilla JS frontend
 │   └── samples/             # Sample creative images
 ├── tests/
-│   ├── test_api.py          # 33 API endpoint tests
+│   ├── test_api.py          # 80 API endpoint tests
 │   ├── test_agents.py       # 27 agent + quality check tests
 │   └── test_rate_limiter.py # 16 rate limiter tests
 ├── monitoring/
 │   ├── prometheus/          # Scrape config
-│   ├── grafana/             # Dashboard + datasource provisioning
+│   ├── grafana/             # Dashboards + datasource provisioning (Prometheus + Loki)
+│   ├── loki/                # Loki + Promtail config
 │   └── pgadmin/             # Auto-connect config
+├── EXPERIMENTS.md           # Step-by-step experiment guide
 ├── Dockerfile
 ├── requirements.txt
 ├── .env.example

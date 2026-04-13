@@ -37,7 +37,7 @@ Variants are tried in batches of 2 from the pool of approved ideas. If a batch f
 - FastAPI with async job lifecycle — POST to submit, GET to poll, results stream in as variants complete
 - Full input validation — file size (50MB), dimensions (8192px), recommendation count (5), text length (2000 chars), RGBA detection
 - Structured JSON logging with job-level correlation IDs
-- Docker Compose with 5 services (backend, PostgreSQL, Prometheus, Grafana, pgAdmin)
+- Docker Compose with 7 services (backend, PostgreSQL, Prometheus, Grafana, pgAdmin, Loki, Promtail)
 
 ### Multi-agent workflow (required)
 
@@ -74,9 +74,13 @@ Static HTML/JS served by FastAPI. No framework, no build step. Sample data pre-l
 
 **Observability** — Prometheus metrics for everything (job lifecycle, LLM latency by provider, variant acceptance rates, parse failures, fallback counts, token usage, cost estimates). Per-agent duration tracking and structured critic evaluation logging. Grafana dashboard with 14 panels, auto-provisioned on first boot. Dependency health checks ping all three LLM providers and PostgreSQL every 30 seconds.
 
-**User feedback** — like/dislike/refine/use-this buttons on each variant. Stored in PostgreSQL with the provider, model, and critic score for later analysis. The idea is to eventually use this to calibrate the critic and tune the ideator prompts.
+**User feedback + critic calibration** — like/dislike/refine/use-this buttons on each variant. Stored in PostgreSQL with the provider, model, and critic score. A calibration endpoint correlates critic scores with user feedback — shows whether high-scoring variants actually get thumbs up, which providers users prefer, and per-recommendation-type satisfaction rates.
 
 **Experiment scaffolding** — per-job config overrides let you change the provider, model, or workflow parameters (retries, variant count) without restarting the server. An experiment registry groups related jobs into named variations for A/B testing. Submit the same creative across all variations in one call, then compare acceptance rates, scores, duration, token usage, and cost side by side. Prompt version hashing tracks which prompt produced each result across runs.
+
+**Gradual rollout** — define weighted rollout configs (e.g. 90% gemini, 10% openai) and jobs are automatically routed. During A/B testing, each variant in a job independently picks its config, so users see a mix of models side by side instead of getting an all-canary job. A performance endpoint shows per-config user feedback rates for data-driven rollout decisions.
+
+**Centralized logging** — Loki + Promtail collect structured JSON logs from the backend. A Grafana Logs Explorer dashboard has pre-built panels for agent performance, critic evaluations, token usage, rate limiting, errors, and job lifecycle events. All fields are queryable (filter by job_id, agent, provider, score, etc.).
 
 ---
 
@@ -94,7 +98,7 @@ Static HTML/JS served by FastAPI. No framework, no build step. Sample data pre-l
 backend/
   app/                    # FastAPI app + agents + services
   static/                 # HTML/JS frontend + sample images
-  tests/                  # 76 tests
-  monitoring/             # Prometheus, Grafana, pgAdmin config
+  tests/                  # 123 tests
+  monitoring/             # Prometheus, Grafana, Loki, pgAdmin config
 ai_engineer_assignment_2026/  # Assignment PDF + sample data
 ```

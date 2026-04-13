@@ -289,18 +289,36 @@ This is the simplest agent — a bridge between the ideator's intent and the ima
 
 ---
 
-## 8. Observability: `app/metrics.py`
+## 8. Observability
+
+### `app/metrics.py`
 
 Prometheus metrics for everything, scraped via the `/metrics` endpoint:
 
 - **Job lifecycle:** `jobs_submitted_total`, `jobs_completed_total` (by status), `jobs_in_progress`
-- **Variant outcomes:** `variants_processed_total` (by status), `variant_score` (histogram), `variant_attempts` (histogram)
+- **Variant outcomes:** `variants_processed_total` (by status), `variant_score` (histogram), `variant_attempts` (histogram), `variant_duration` (histogram)
 - **LLM API calls:** `llm_call_duration_seconds` (by provider/type), `llm_calls_total`, `llm_errors_total` (by provider/type/error)
-- **Agent-specific:** `agent_invocations_total` (by agent), `llm_parse_failures_total` (by agent)
+- **Token usage:** `llm_tokens_total` (by provider/call_type/token_type), `agent_tokens` (by agent/token_type)
+- **Cost:** `llm_estimated_cost` (by provider/call_type)
+- **Agent-specific:** `agent_invocations_total` (by agent), `agent_duration` (histogram by agent), `llm_parse_failures_total` (by agent)
 - **Dependency health:** `dependency_up` (gauge by dependency), `dependency_latency_ms`
 - **Rate limiting:** `current_rate_limit` (gauge), `provider_fallbacks_total` (by primary/fallback/type)
 
-These metrics feed a Grafana dashboard with 14 panels, auto-provisioned via the `monitoring/grafana/` config.
+### `app/services/cost.py`
+
+Per-model pricing tables for estimating cost. `estimate_token_cost()` uses published per-million-token rates, `estimate_image_cost()` uses per-image rates. Called from `llm.py` after each API call.
+
+### `app/workflow/prompt_versions.py`
+
+SHA-256 hashes of all agent prompt constants, computed once at import time. Stored with every `VariantResult` so you can detect prompt drift across experiment runs without storing the full prompt text.
+
+### Centralized logging (Loki + Promtail)
+
+Promtail ships container logs to Loki. Grafana has a Logs Explorer dashboard (`/d/visrec-logs`) with pre-built panels for agent performance, critic evaluations, token usage, rate limiting, errors, and job lifecycle. Since the backend logs are structured JSON (structlog), every field is queryable.
+
+### `app/workflow/agents/__init__.py` — `timed_agent` decorator
+
+Wraps each LangGraph agent node with duration tracking, token accumulation (via ContextVar), and structured logging. Emits `agent_completed` events with duration, total tokens, cost, and prompt version. Applied to the editor, critic, and refiner.
 
 ---
 
@@ -317,12 +335,14 @@ A Python 3.12 slim image:
 
 ### `docker-compose.yml` (project root)
 
-Five services:
+Seven services:
 - **db** — PostgreSQL 16 with a named volume for data persistence
 - **backend** — builds from `backend/Dockerfile`, mounts `app/` and `static/` for hot-reload, depends on `db`
 - **pgadmin** — database browser, auto-configured to connect to `db`
 - **prometheus** — scrapes the backend's `/metrics` endpoint every 5s
-- **grafana** — auto-provisions the datasource and dashboard on first boot
+- **loki** — log aggregation, queryable from Grafana
+- **promtail** — ships container logs to Loki, extracts structured JSON fields
+- **grafana** — auto-provisions datasources (Prometheus + Loki) and dashboards on first boot
 
 ### `requirements.txt`
 
@@ -344,11 +364,11 @@ Key dependencies:
 
 ### `tests/`
 
-76 tests across 3 files, all run in ~3 seconds with no API keys:
+123 tests across 3 files, all run in ~7 seconds with no API keys:
 
 - `test_agents.py` (27) — agent logic, SSIM computation, blind comparison routing, parse failures, fallbacks, conditional routing edge cases
-- `test_api.py` (33) — input validation (file size, dimensions, content type, recommendation count, text length), job lifecycle, cancel, feedback, thumbnails, DB persistence, CORS, metrics
-- `test_rate_limiter.py` (16) — error detection (`_is_rate_limit_error` distinguishing transient vs permanent), adaptive backoff, recovery after consecutive successes, per-provider isolation
+- `test_api.py` (80) — input validation, job lifecycle, cancel, feedback, thumbnails, DB persistence, CORS, metrics, config overrides, experiments, calibration, rollout routing, error messages
+- `test_rate_limiter.py` (16) — error detection, adaptive backoff, recovery after consecutive successes, per-provider isolation
 
 All tests use mocked LLM calls via `unittest.mock.patch`.
 
@@ -408,3 +428,31 @@ Each `VariantResult` in the response contains:
 - Evaluation feedback from the critic
 - A full audit trail showing every decision made by every agent at every attempt
 - The text and image provider/model that produced it
+- Duration, token usage, and cost estimate
+- Per-agent timing breakdown
+- Prompt version hashes
+- Structured critic evaluation history (all attempts, not just the final one)
+
+---
+
+## Experiment & rollout system
+
+### Per-job config overrides
+
+Any job can override the global provider/model settings by including `config_overrides` in the request body. The `RuntimeConfig` class merges these with defaults, and the effective config is snapshotted with the job for reproducibility.
+
+### Experiments
+
+The experiment registry (`POST /api/v1/experiments`) lets you define named config variations and run them against the same input. `POST /api/v1/experiments/{id}/run` creates one job per variation, all tagged with the experiment ID. `GET /api/v1/experiments/{id}/results` compares acceptance rates, scores, duration, tokens, and cost across variations.
+
+See `EXPERIMENTS.md` for a step-by-step guide.
+
+### Gradual rollout
+
+The `rollout_configs` table stores weighted config entries. When a job is submitted without explicit overrides, the system picks a config via weighted random selection. During A/B testing, each variant in a batch independently picks its own config — so a single job shows variants from different models side by side. Users always see a mix instead of getting an all-canary job.
+
+`GET /api/v1/rollout/performance` shows per-config user feedback rates for data-driven rollout decisions.
+
+### Critic calibration
+
+`GET /api/v1/feedback/calibration` correlates the critic's scores with user feedback. Shows score distributions by sentiment (positive vs negative), per-provider satisfaction rates, threshold analysis (what score cutoff maximizes user agreement), and per-recommendation-type breakdown. This is how you check whether the critic is actually calibrated — whether high scores correspond to variants users like.
